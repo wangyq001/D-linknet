@@ -1,0 +1,11 @@
+# Keep parent directories, ignore all contents (runtime-generated artifacts)
+
+# Python cache
+__pycache__/**
+**/__pycache__
+
+# Generated artifacts
+logs/**
+predictions/**
+weights/**
+dataset/**

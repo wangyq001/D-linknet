@@ -1,0 +1,15 @@
+# Keep parent directories, ignore all contents (runtime-generated artifacts)
+
+# Python cache (all locations)
+__pycache__
+**/__pycache__
+
+# D-linknet generated artifacts
+D-linknet/__pycache__/**
+D-linknet/logs/**
+D-linknet/predictions/**
+D-linknet/weights/**
+D-linknet/dataset/**
+
+# Report generated artifacts
+report/**

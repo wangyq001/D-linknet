@@ -30,18 +30,18 @@ import torch
 
 # --- 模型名称：需与 networks/dinknet.py 中定义的类名一致
 #   可选: DinkNet34 / DinkNet34_less_pool / DinkNet50 / DinkNet101 / LinkNet34
-MODEL_NAME = 'DinkNet34'
+MODEL_NAME = 'DinkNet34_less_pool_DualHead'
 
 # 推理图像所在目录（支持 .tif / .jpg / .png，自动识别，排除 _mask 文件）
 IMAGE_DIR = '/root/autodl-tmp/DLinknet/D-linknet/dataset/val/images'
 
 # 模型权重文件路径（.th 或 .pth 格式）
-WEIGHT_PATH = '/root/autodl-tmp/DLinknet/D-linknet/weights/dink34_002.th'
+WEIGHT_PATH = '/root/autodl-tmp/DLinknet/D-linknet/weights/dink34_009_dual.th'
 
 # 推理输出目录
 #   概率图：{OUTPUT_DIR}/{name}_prob.npy    float32, [0,1]
 #   二值掩码：{OUTPUT_DIR}/{name}_pred.png  uint8, 0/255
-OUTPUT_DIR = '/root/autodl-tmp/DLinknet/D-linknet/predictions/002TTA'
+OUTPUT_DIR = '/root/autodl-tmp/DLinknet/D-linknet/predictions/dink34_009_noTTA'
 
 # 输入图像的目标尺寸，需与训练时 IMAGE_SHAPE 保持一致
 IMG_SHAPE = (1024, 1024)
@@ -49,7 +49,7 @@ IMG_SHAPE = (1024, 1024)
 # 是否启用测试时增强（TTA）
 #   True  = 启用 4-way TTA（与原作者 test.py 一致），精度更高，速度慢约 4 倍
 #   False = 禁用 TTA，单次推理，速度快
-TTA_ENABLE = True
+TTA_ENABLE = False
 # TTA_ENABLE = False
 
 # 二值化阈值：大于此值的像素判定为道路
@@ -57,24 +57,48 @@ TTA_ENABLE = True
 #   归一化后阈值 0.25 ≈ 原作者原始阈值 1.0
 MASK_THRESHOLD = 0.8
 
-# =============================================================================
-# 以下代码通常不需要修改
-# =============================================================================
+# --- 是否启用双头推理（草线 + 植被）
+# True = 推理双头模型，输出 grass_prob.npy, grass_pred.png, veg_prob.npy, veg_pred.png
+DUAL_HEAD = True
+
+# --- 双头推理时需要配置的模型名称
+# 可选: DinkNet34_DualHead / LinkNet34_DualHead / DinkNet50_DualHead /
+#       DinkNet101_DualHead / DinkNet34_less_pool_DualHead
+# 仅在 DUAL_HEAD=True 时使用
+DUAL_HEAD_MODEL_NAME = 'DinkNet34_less_pool_DualHead'
 
 
 def build_net():
-    """根据 MODEL_NAME 构建对应网络，加载权重，进入 eval 模式，自动适配多卡。"""
-    from networks.dinknet import DinkNet34, DinkNet34_less_pool, DinkNet50, DinkNet101, LinkNet34
-    model_map = {
-        'DinkNet34': DinkNet34,
-        'DinkNet34_less_pool': DinkNet34_less_pool,
-        'DinkNet50': DinkNet50,
-        'DinkNet101': DinkNet101,
-        'LinkNet34': LinkNet34,
-    }
-    if MODEL_NAME not in model_map:
-        raise ValueError(f"Unknown MODEL_NAME: {MODEL_NAME}. Available: {list(model_map.keys())}")
-    net = model_map[MODEL_NAME]().cuda()
+    """根据 MODEL_NAME / DUAL_HEAD_MODEL_NAME 构建网络，加载权重，进入 eval 模式。"""
+    from networks.dinknet import (
+        DinkNet34, DinkNet34_less_pool, DinkNet50, DinkNet101, LinkNet34,
+        DinkNet34_DualHead, LinkNet34_DualHead, DinkNet50_DualHead,
+        DinkNet101_DualHead, DinkNet34_less_pool_DualHead,
+    )
+
+    if DUAL_HEAD:
+        model_map = {
+            'DinkNet34_DualHead': DinkNet34_DualHead,
+            'LinkNet34_DualHead': LinkNet34_DualHead,
+            'DinkNet50_DualHead': DinkNet50_DualHead,
+            'DinkNet101_DualHead': DinkNet101_DualHead,
+            'DinkNet34_less_pool_DualHead': DinkNet34_less_pool_DualHead,
+        }
+        model_name = DUAL_HEAD_MODEL_NAME
+    else:
+        model_map = {
+            'DinkNet34': DinkNet34,
+            'DinkNet34_less_pool': DinkNet34_less_pool,
+            'DinkNet50': DinkNet50,
+            'DinkNet101': DinkNet101,
+            'LinkNet34': LinkNet34,
+        }
+        model_name = MODEL_NAME
+
+    if model_name not in model_map:
+        raise ValueError(f"Unknown model: {model_name}. Available: {list(model_map.keys())}")
+
+    net = model_map[model_name]().cuda()
     net = torch.nn.DataParallel(net, device_ids=range(torch.cuda.device_count()))
     state = torch.load(WEIGHT_PATH, map_location='cuda', weights_only=True)
     net.load_state_dict(state)
@@ -92,7 +116,12 @@ def predict_one_original(net, img):
         img4 = [img2 垂直翻转, ...]
     共 4 张增强图，两两打包为一个 batch，分 4 次送入网络。
     返回归一化后的概率图，范围 [0, 1]。
+
+    双头模式（is_dual=True）时：返回 (grass_prob, veg_prob)
+    单头模式：返回 prob_map
     """
+    is_dual = DUAL_HEAD
+
     if img.shape[:2] != IMG_SHAPE:
         img = cv2.resize(img, IMG_SHAPE, interpolation=cv2.INTER_LINEAR)
 
@@ -113,20 +142,49 @@ def predict_one_original(net, img):
     img4 = torch.Tensor(img4 / 255.0 * 3.2 - 1.6).cuda()
 
     with torch.no_grad():
-        maska = net(img1).squeeze().cpu().data.numpy()
-        maskb = net(img2).squeeze().cpu().data.numpy()
-        maskc = net(img3).squeeze().cpu().data.numpy()
-        maskd = net(img4).squeeze().cpu().data.numpy()
+        if is_dual:
+            out1 = net(img1)
+            out2 = net(img2)
+            out3 = net(img3)
+            out4 = net(img4)
 
-    mask1 = maska + maskb[:, ::-1] + maskc[:, :, ::-1] + maskd[:, ::-1, ::-1]
-    mask2 = mask1[0] + np.rot90(mask1[1])[::-1, ::-1]
+            if isinstance(out1, (list, tuple)):
+                g1, v1 = out1
+                g2, v2 = out2
+                g3, v3 = out3
+                g4, v4 = out4
 
-    return mask2 / 4.0
+                def combine_tta(ga, gb, gc, gd):
+                    m1 = ga.squeeze().cpu().data.numpy()
+                    m2 = gb.squeeze().cpu().data.numpy()
+                    m3 = gc.squeeze().cpu().data.numpy()
+                    m4 = gd.squeeze().cpu().data.numpy()
+                    mask1 = m1 + m2[:, ::-1] + m3[:, :, ::-1] + m4[:, ::-1, ::-1]
+                    mask2 = mask1[0] + np.rot90(mask1[1])[::-1, ::-1]
+                    return mask2 / 4.0
+
+                grass_prob = combine_tta(g1, g2, g3, g4)
+                veg_prob  = combine_tta(v1, v2, v3, v4)
+                return grass_prob, veg_prob
+            else:
+                out1, out2 = out1, out2
+        else:
+            maska = net(img1).squeeze().cpu().data.numpy()
+            maskb = net(img2).squeeze().cpu().data.numpy()
+            maskc = net(img3).squeeze().cpu().data.numpy()
+            maskd = net(img4).squeeze().cpu().data.numpy()
+
+    if not is_dual:
+        mask1 = maska + maskb[:, ::-1] + maskc[:, :, ::-1] + maskd[:, ::-1, ::-1]
+        mask2 = mask1[0] + np.rot90(mask1[1])[::-1, ::-1]
+        return mask2 / 4.0
 
 
 def predict_one_single(net, img):
     """
     无 TTA 的单次推理，返回 sigmoid 概率图 (H, W)，范围 [0, 1]。
+    双头模式：返回 (grass_prob, veg_prob)
+    单头模式：返回 prob_map
     """
     if img.shape[:2] != IMG_SHAPE:
         img = cv2.resize(img, IMG_SHAPE, interpolation=cv2.INTER_LINEAR)
@@ -136,9 +194,16 @@ def predict_one_single(net, img):
     inp = torch.from_numpy(img).unsqueeze(0).cuda()
 
     with torch.no_grad():
-        out = net(inp).squeeze(1).cpu().numpy()[0]
+        out = net(inp)
 
-    return out
+    if DUAL_HEAD and isinstance(out, (list, tuple)):
+        g, v = out
+        g = g.squeeze(1).cpu().numpy()[0]
+        v = v.squeeze(1).cpu().numpy()[0]
+        return g, v
+    else:
+        out = out.squeeze(1).cpu().numpy()[0]
+        return out
 
 
 def detect_image_files(directory):
@@ -157,14 +222,18 @@ def ensure_dir(path):
 
 def main():
     print("=" * 60)
-    print("D-LinkNet 推理脚本")
+    mode_str = "双头推理" if DUAL_HEAD else "D-LinkNet 推理"
+    print(f"D-LinkNet {mode_str}脚本")
     print("=" * 60)
 
     assert os.path.isdir(IMAGE_DIR),   f"图像目录不存在: {IMAGE_DIR}"
     assert os.path.isfile(WEIGHT_PATH), f"权重文件不存在: {WEIGHT_PATH}"
 
     print(f"\n图像目录 : {IMAGE_DIR}")
-    print(f"模型名称 : {MODEL_NAME}")
+    if DUAL_HEAD:
+        print(f"模型名称 : {DUAL_HEAD_MODEL_NAME} (双头模式)")
+    else:
+        print(f"模型名称 : {MODEL_NAME}")
     print(f"权重文件 : {WEIGHT_PATH}")
     print(f"输出目录 : {OUTPUT_DIR}")
     print(f"图像尺寸 : {IMG_SHAPE}")
@@ -178,6 +247,10 @@ def main():
     print(f"[{time.strftime('%H:%M:%S')}] 网络加载完成，GPU: {gpu_name} x {gpu_count}")
 
     ensure_dir(OUTPUT_DIR)
+
+    if DUAL_HEAD:
+        ensure_dir(os.path.join(OUTPUT_DIR, 'grass'))
+        ensure_dir(os.path.join(OUTPUT_DIR, 'veg'))
 
     image_files = detect_image_files(IMAGE_DIR)
     n = len(image_files)
@@ -199,29 +272,50 @@ def main():
             continue
 
         if TTA_ENABLE:
-            prob_map = predict_one_original(net, img)
+            result = predict_one_original(net, img)
         else:
-            prob_map = predict_one_single(net, img)
+            result = predict_one_single(net, img)
 
-        # 保存概率图（float32, [0,1]），供 evaluate_metrics.py 多阈值评估使用
-        prob_npy_path = os.path.join(OUTPUT_DIR, base_name + '_prob.npy')
-        np.save(prob_npy_path, prob_map.astype(np.float32))
-
-        # 保存二值掩码（用于可视化）
-        binary = (prob_map > MASK_THRESHOLD).astype(np.uint8) * 255
-        pred_path = os.path.join(OUTPUT_DIR, base_name + '_pred.png')
-        cv2.imwrite(pred_path, binary)
+        if DUAL_HEAD:
+            grass_prob, veg_prob = result
+            # 草线输出
+            np.save(os.path.join(OUTPUT_DIR, 'grass', f'{base_name}_grass_prob.npy'),
+                    grass_prob.astype(np.float32))
+            cv2.imwrite(os.path.join(OUTPUT_DIR, 'grass', f'{base_name}_grass_pred.png'),
+                        (grass_prob > MASK_THRESHOLD).astype(np.uint8) * 255)
+            # 植被输出
+            np.save(os.path.join(OUTPUT_DIR, 'veg', f'{base_name}_veg_prob.npy'),
+                    veg_prob.astype(np.float32))
+            cv2.imwrite(os.path.join(OUTPUT_DIR, 'veg', f'{base_name}_veg_pred.png'),
+                        (veg_prob > MASK_THRESHOLD).astype(np.uint8) * 255)
+            print_str = (f"  [{i+1:3d}/{n}] {filename}"
+                         f"  | grass [{grass_prob.min():.3f}, {grass_prob.max():.3f}]"
+                         f"  | veg [{veg_prob.min():.3f}, {veg_prob.max():.3f}]")
+        else:
+            prob_map = result
+            np.save(os.path.join(OUTPUT_DIR, f'{base_name}_prob.npy'),
+                    prob_map.astype(np.float32))
+            cv2.imwrite(os.path.join(OUTPUT_DIR, f'{base_name}_pred.png'),
+                        (prob_map > MASK_THRESHOLD).astype(np.uint8) * 255)
+            print_str = (f"  [{i+1:3d}/{n}] {filename}"
+                         f"  | prob [{prob_map.min():.3f}, {prob_map.max():.3f}]")
 
         elapsed = time.time() - t0
         eta = elapsed / (i + 1) * (n - i - 1) if i < n - 1 else 0
-        print(f"  [{i+1:3d}/{n}] {filename}  | prob [{prob_map.min():.3f}, {prob_map.max():.3f}]"
-              f"  | ETA {eta:.0f}s")
+        print(f"{print_str}  | ETA {eta:.0f}s")
 
     total_time = time.time() - t0
     print(f"\n[推理完成] {n} 张图像，耗时 {total_time:.1f}s "
           f"（平均 {total_time/n:.2f}s/张）")
-    print(f"[概率图]   {OUTPUT_DIR}/*_prob.npy")
-    print(f"[二值图]   {OUTPUT_DIR}/*_pred.png")
+
+    if DUAL_HEAD:
+        print(f"[草线概率图] {OUTPUT_DIR}/grass/*_grass_prob.npy")
+        print(f"[草线二值图] {OUTPUT_DIR}/grass/*_grass_pred.png")
+        print(f"[植被概率图] {OUTPUT_DIR}/veg/*_veg_prob.npy")
+        print(f"[植被二值图] {OUTPUT_DIR}/veg/*_veg_pred.png")
+    else:
+        print(f"[概率图]   {OUTPUT_DIR}/*_prob.npy")
+        print(f"[二值图]   {OUTPUT_DIR}/*_pred.png")
     print(f"\n运行评估脚本: python D-linknet/evaluate_metrics.py")
 
 

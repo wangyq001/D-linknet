@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 from torchvision import models
 import torch.nn.functional as F
+import copy
 
 from functools import partial
 
@@ -302,7 +303,12 @@ class DinkNet101(nn.Module):
 
         return torch.sigmoid(out)
 
+
 class LinkNet34(nn.Module):
+    """
+    LinkNet34 — Chaurasia & Culurciello, arXiv:1710.07759, 2017 [论文1]
+    无 D-Block 的标准 LinkNet，使用 ResNet34 作为 encoder。
+    """
     def __init__(self, num_classes=1):
         super(LinkNet34, self).__init__()
 
@@ -351,3 +357,392 @@ class LinkNet34(nn.Module):
         out = self.finalconv3(out)
 
         return torch.sigmoid(out)
+
+
+# ================================================================
+# 双头分割模型系列
+# 共享 encoder + D-Block，两个独立 decoder 分支输出草线和植被
+# 参考 docs/方案一详细设计文档.md
+# ================================================================
+
+class DinkNet34_DualHead(nn.Module):
+    """
+    DinkNet34 双头版本：共享 encoder + D-Block，独立 decoder 分支。
+
+    架构:
+        输入 (3, H, W)
+            ↓
+        ResNet34 Encoder（ImageNet 预训练，完全共享）
+            ↓
+        D-Block (d=1,2,4,8，完全共享)
+            ↓
+        ┌──────────────────┬──────────────────┐
+        ↓                              ↓
+    草线解码器                  植被解码器
+    (DecoderBlock × 4 +          (DecoderBlock × 4 +
+     finaldeconv +              独立副本，
+     finalconv3)                 finalconv3)
+            ↓                              ↓
+    sigmoid → (1,H,W)      sigmoid → (1,H,W)
+    """
+    def __init__(self, num_classes=1):
+        super().__init__()
+        shared = DinkNet34(num_classes=num_classes)
+
+        self.firstconv = shared.firstconv
+        self.firstbn   = shared.firstbn
+        self.firstrelu = shared.firstrelu
+        self.firstmaxpool = shared.firstmaxpool
+        self.encoder1 = shared.encoder1
+        self.encoder2 = shared.encoder2
+        self.encoder3 = shared.encoder3
+        self.encoder4 = shared.encoder4
+        self.dblock  = shared.dblock
+
+        self.decoder4_grass = copy.deepcopy(shared.decoder4)
+        self.decoder3_grass = copy.deepcopy(shared.decoder3)
+        self.decoder2_grass = copy.deepcopy(shared.decoder2)
+        self.decoder1_grass = copy.deepcopy(shared.decoder1)
+        self.finaldeconv1_grass = copy.deepcopy(shared.finaldeconv1)
+        self.finalrelu1_grass   = copy.deepcopy(shared.finalrelu1)
+        self.finalconv2_grass   = copy.deepcopy(shared.finalconv2)
+        self.finalrelu2_grass   = shared.finalrelu2
+        self.finalconv3_grass   = copy.deepcopy(shared.finalconv3)
+
+        self.decoder4_veg = copy.deepcopy(shared.decoder4)
+        self.decoder3_veg = copy.deepcopy(shared.decoder3)
+        self.decoder2_veg = copy.deepcopy(shared.decoder2)
+        self.decoder1_veg = copy.deepcopy(shared.decoder1)
+        self.finaldeconv1_veg = copy.deepcopy(shared.finaldeconv1)
+        self.finalrelu1_veg   = copy.deepcopy(shared.finalrelu1)
+        self.finalconv2_veg   = copy.deepcopy(shared.finalconv2)
+        self.finalrelu2_veg   = shared.finalrelu2
+        self.finalconv3_veg   = copy.deepcopy(shared.finalconv3)
+
+        del shared
+
+    def forward(self, x):
+        x = self.firstconv(x)
+        x = self.firstbn(x)
+        x = self.firstrelu(x)
+        x = self.firstmaxpool(x)
+        e1 = self.encoder1(x)
+        e2 = self.encoder2(e1)
+        e3 = self.encoder3(e2)
+        e4 = self.encoder4(e3)
+        e4 = self.dblock(e4)
+
+        d4_g = self.decoder4_grass(e4) + e3
+        d3_g = self.decoder3_grass(d4_g) + e2
+        d2_g = self.decoder2_grass(d3_g) + e1
+        d1_g = self.decoder1_grass(d2_g)
+        out_g = self.finaldeconv1_grass(d1_g)
+        out_g = self.finalrelu1_grass(out_g)
+        out_g = self.finalconv2_grass(out_g)
+        out_g = self.finalrelu2_grass(out_g)
+        out_g = self.finalconv3_grass(out_g)
+        out_g = torch.sigmoid(out_g)
+
+        d4_v = self.decoder4_veg(e4) + e3
+        d3_v = self.decoder3_veg(d4_v) + e2
+        d2_v = self.decoder2_veg(d3_v) + e1
+        d1_v = self.decoder1_veg(d2_v)
+        out_v = self.finaldeconv1_veg(d1_v)
+        out_v = self.finalrelu1_veg(out_v)
+        out_v = self.finalconv2_veg(out_v)
+        out_v = self.finalrelu2_veg(out_v)
+        out_v = self.finalconv3_veg(out_v)
+        out_v = torch.sigmoid(out_v)
+
+        return out_g, out_v
+
+
+class LinkNet34_DualHead(nn.Module):
+    """LinkNet34 双头版本（无 D-Block）。"""
+    def __init__(self, num_classes=1):
+        super().__init__()
+        shared = LinkNet34(num_classes=num_classes)
+
+        self.firstconv = shared.firstconv
+        self.firstbn   = shared.firstbn
+        self.firstrelu = shared.firstrelu
+        self.firstmaxpool = shared.firstmaxpool
+        self.encoder1 = shared.encoder1
+        self.encoder2 = shared.encoder2
+        self.encoder3 = shared.encoder3
+        self.encoder4 = shared.encoder4
+
+        self.decoder4_grass = copy.deepcopy(shared.decoder4)
+        self.decoder3_grass = copy.deepcopy(shared.decoder3)
+        self.decoder2_grass = copy.deepcopy(shared.decoder2)
+        self.decoder1_grass = copy.deepcopy(shared.decoder1)
+        self.finaldeconv1_grass = copy.deepcopy(shared.finaldeconv1)
+        self.finalrelu1_grass   = copy.deepcopy(shared.finalrelu1)
+        self.finalconv2_grass   = copy.deepcopy(shared.finalconv2)
+        self.finalrelu2_grass   = shared.finalrelu2
+        self.finalconv3_grass   = copy.deepcopy(shared.finalconv3)
+
+        self.decoder4_veg = copy.deepcopy(shared.decoder4)
+        self.decoder3_veg = copy.deepcopy(shared.decoder3)
+        self.decoder2_veg = copy.deepcopy(shared.decoder2)
+        self.decoder1_veg = copy.deepcopy(shared.decoder1)
+        self.finaldeconv1_veg = copy.deepcopy(shared.finaldeconv1)
+        self.finalrelu1_veg   = copy.deepcopy(shared.finalrelu1)
+        self.finalconv2_veg   = copy.deepcopy(shared.finalconv2)
+        self.finalrelu2_veg   = shared.finalrelu2
+        self.finalconv3_veg   = copy.deepcopy(shared.finalconv3)
+
+        del shared
+
+    def forward(self, x):
+        x = self.firstconv(x)
+        x = self.firstbn(x)
+        x = self.firstrelu(x)
+        x = self.firstmaxpool(x)
+        e1 = self.encoder1(x)
+        e2 = self.encoder2(e1)
+        e3 = self.encoder3(e2)
+        e4 = self.encoder4(e3)
+
+        d4_g = self.decoder4_grass(e4) + e3
+        d3_g = self.decoder3_grass(d4_g) + e2
+        d2_g = self.decoder2_grass(d3_g) + e1
+        d1_g = self.decoder1_grass(d2_g)
+        out_g = self.finaldeconv1_grass(d1_g)
+        out_g = self.finalrelu1_grass(out_g)
+        out_g = self.finalconv2_grass(out_g)
+        out_g = self.finalrelu2_grass(out_g)
+        out_g = self.finalconv3_grass(out_g)
+        out_g = torch.sigmoid(out_g)
+
+        d4_v = self.decoder4_veg(e4) + e3
+        d3_v = self.decoder3_veg(d4_v) + e2
+        d2_v = self.decoder2_veg(d3_v) + e1
+        d1_v = self.decoder1_veg(d2_v)
+        out_v = self.finaldeconv1_veg(d1_v)
+        out_v = self.finalrelu1_veg(out_v)
+        out_v = self.finalconv2_veg(out_v)
+        out_v = self.finalrelu2_veg(out_v)
+        out_v = self.finalconv3_veg(out_v)
+        out_v = torch.sigmoid(out_v)
+
+        return out_g, out_v
+
+
+class DinkNet50_DualHead(nn.Module):
+    """DinkNet50 双头版本。"""
+    def __init__(self, num_classes=1):
+        super().__init__()
+        shared = DinkNet50(num_classes=num_classes)
+
+        self.firstconv = shared.firstconv
+        self.firstbn   = shared.firstbn
+        self.firstrelu = shared.firstrelu
+        self.firstmaxpool = shared.firstmaxpool
+        self.encoder1 = shared.encoder1
+        self.encoder2 = shared.encoder2
+        self.encoder3 = shared.encoder3
+        self.encoder4 = shared.encoder4
+        self.dblock  = shared.dblock
+
+        self.decoder4_grass = copy.deepcopy(shared.decoder4)
+        self.decoder3_grass = copy.deepcopy(shared.decoder3)
+        self.decoder2_grass = copy.deepcopy(shared.decoder2)
+        self.decoder1_grass = copy.deepcopy(shared.decoder1)
+        self.finaldeconv1_grass = copy.deepcopy(shared.finaldeconv1)
+        self.finalrelu1_grass   = copy.deepcopy(shared.finalrelu1)
+        self.finalconv2_grass   = copy.deepcopy(shared.finalconv2)
+        self.finalrelu2_grass   = shared.finalrelu2
+        self.finalconv3_grass   = copy.deepcopy(shared.finalconv3)
+
+        self.decoder4_veg = copy.deepcopy(shared.decoder4)
+        self.decoder3_veg = copy.deepcopy(shared.decoder3)
+        self.decoder2_veg = copy.deepcopy(shared.decoder2)
+        self.decoder1_veg = copy.deepcopy(shared.decoder1)
+        self.finaldeconv1_veg = copy.deepcopy(shared.finaldeconv1)
+        self.finalrelu1_veg   = copy.deepcopy(shared.finalrelu1)
+        self.finalconv2_veg   = copy.deepcopy(shared.finalconv2)
+        self.finalrelu2_veg   = shared.finalrelu2
+        self.finalconv3_veg   = copy.deepcopy(shared.finalconv3)
+
+        del shared
+
+    def forward(self, x):
+        x = self.firstconv(x)
+        x = self.firstbn(x)
+        x = self.firstrelu(x)
+        x = self.firstmaxpool(x)
+        e1 = self.encoder1(x)
+        e2 = self.encoder2(e1)
+        e3 = self.encoder3(e2)
+        e4 = self.encoder4(e3)
+        e4 = self.dblock(e4)
+
+        d4_g = self.decoder4_grass(e4) + e3
+        d3_g = self.decoder3_grass(d4_g) + e2
+        d2_g = self.decoder2_grass(d3_g) + e1
+        d1_g = self.decoder1_grass(d2_g)
+        out_g = self.finaldeconv1_grass(d1_g)
+        out_g = self.finalrelu1_grass(out_g)
+        out_g = self.finalconv2_grass(out_g)
+        out_g = self.finalrelu2_grass(out_g)
+        out_g = self.finalconv3_grass(out_g)
+        out_g = torch.sigmoid(out_g)
+
+        d4_v = self.decoder4_veg(e4) + e3
+        d3_v = self.decoder3_veg(d4_v) + e2
+        d2_v = self.decoder2_veg(d3_v) + e1
+        d1_v = self.decoder1_veg(d2_v)
+        out_v = self.finaldeconv1_veg(d1_v)
+        out_v = self.finalrelu1_veg(out_v)
+        out_v = self.finalconv2_veg(out_v)
+        out_v = self.finalrelu2_veg(out_v)
+        out_v = self.finalconv3_veg(out_v)
+        out_v = torch.sigmoid(out_v)
+
+        return out_g, out_v
+
+
+class DinkNet101_DualHead(nn.Module):
+    """DinkNet101 双头版本。"""
+    def __init__(self, num_classes=1):
+        super().__init__()
+        shared = DinkNet101(num_classes=num_classes)
+
+        self.firstconv = shared.firstconv
+        self.firstbn   = shared.firstbn
+        self.firstrelu = shared.firstrelu
+        self.firstmaxpool = shared.firstmaxpool
+        self.encoder1 = shared.encoder1
+        self.encoder2 = shared.encoder2
+        self.encoder3 = shared.encoder3
+        self.encoder4 = shared.encoder4
+        self.dblock  = shared.dblock
+
+        self.decoder4_grass = copy.deepcopy(shared.decoder4)
+        self.decoder3_grass = copy.deepcopy(shared.decoder3)
+        self.decoder2_grass = copy.deepcopy(shared.decoder2)
+        self.decoder1_grass = copy.deepcopy(shared.decoder1)
+        self.finaldeconv1_grass = copy.deepcopy(shared.finaldeconv1)
+        self.finalrelu1_grass   = copy.deepcopy(shared.finalrelu1)
+        self.finalconv2_grass   = copy.deepcopy(shared.finalconv2)
+        self.finalrelu2_grass   = shared.finalrelu2
+        self.finalconv3_grass   = copy.deepcopy(shared.finalconv3)
+
+        self.decoder4_veg = copy.deepcopy(shared.decoder4)
+        self.decoder3_veg = copy.deepcopy(shared.decoder3)
+        self.decoder2_veg = copy.deepcopy(shared.decoder2)
+        self.decoder1_veg = copy.deepcopy(shared.decoder1)
+        self.finaldeconv1_veg = copy.deepcopy(shared.finaldeconv1)
+        self.finalrelu1_veg   = copy.deepcopy(shared.finalrelu1)
+        self.finalconv2_veg   = copy.deepcopy(shared.finalconv2)
+        self.finalrelu2_veg   = shared.finalrelu2
+        self.finalconv3_veg   = copy.deepcopy(shared.finalconv3)
+
+        del shared
+
+    def forward(self, x):
+        x = self.firstconv(x)
+        x = self.firstbn(x)
+        x = self.firstrelu(x)
+        x = self.firstmaxpool(x)
+        e1 = self.encoder1(x)
+        e2 = self.encoder2(e1)
+        e3 = self.encoder3(e2)
+        e4 = self.encoder4(e3)
+        e4 = self.dblock(e4)
+
+        d4_g = self.decoder4_grass(e4) + e3
+        d3_g = self.decoder3_grass(d4_g) + e2
+        d2_g = self.decoder2_grass(d3_g) + e1
+        d1_g = self.decoder1_grass(d2_g)
+        out_g = self.finaldeconv1_grass(d1_g)
+        out_g = self.finalrelu1_grass(out_g)
+        out_g = self.finalconv2_grass(out_g)
+        out_g = self.finalrelu2_grass(out_g)
+        out_g = self.finalconv3_grass(out_g)
+        out_g = torch.sigmoid(out_g)
+
+        d4_v = self.decoder4_veg(e4) + e3
+        d3_v = self.decoder3_veg(d4_v) + e2
+        d2_v = self.decoder2_veg(d3_v) + e1
+        d1_v = self.decoder1_veg(d2_v)
+        out_v = self.finaldeconv1_veg(d1_v)
+        out_v = self.finalrelu1_veg(out_v)
+        out_v = self.finalconv2_veg(out_v)
+        out_v = self.finalrelu2_veg(out_v)
+        out_v = self.finalconv3_veg(out_v)
+        out_v = torch.sigmoid(out_v)
+
+        return out_g, out_v
+
+
+class DinkNet34_less_pool_DualHead(nn.Module):
+    """
+    DinkNet34_less_pool 双头版本。
+    encoder4 被跳过，dblock 的通道数为 256。
+    """
+    def __init__(self, num_classes=1):
+        super().__init__()
+        shared = DinkNet34_less_pool(num_classes=num_classes)
+
+        self.firstconv = shared.firstconv
+        self.firstbn   = shared.firstbn
+        self.firstrelu = shared.firstrelu
+        self.firstmaxpool = shared.firstmaxpool
+        self.encoder1 = shared.encoder1
+        self.encoder2 = shared.encoder2
+        self.encoder3 = shared.encoder3
+        self.dblock  = shared.dblock
+
+        self.decoder3_grass = copy.deepcopy(shared.decoder3)
+        self.decoder2_grass = copy.deepcopy(shared.decoder2)
+        self.decoder1_grass = copy.deepcopy(shared.decoder1)
+        self.finaldeconv1_grass = copy.deepcopy(shared.finaldeconv1)
+        self.finalrelu1_grass   = copy.deepcopy(shared.finalrelu1)
+        self.finalconv2_grass   = copy.deepcopy(shared.finalconv2)
+        self.finalrelu2_grass   = shared.finalrelu2
+        self.finalconv3_grass   = copy.deepcopy(shared.finalconv3)
+
+        self.decoder3_veg = copy.deepcopy(shared.decoder3)
+        self.decoder2_veg = copy.deepcopy(shared.decoder2)
+        self.decoder1_veg = copy.deepcopy(shared.decoder1)
+        self.finaldeconv1_veg = copy.deepcopy(shared.finaldeconv1)
+        self.finalrelu1_veg   = copy.deepcopy(shared.finalrelu1)
+        self.finalconv2_veg   = copy.deepcopy(shared.finalconv2)
+        self.finalrelu2_veg   = shared.finalrelu2
+        self.finalconv3_veg   = copy.deepcopy(shared.finalconv3)
+
+        del shared
+
+    def forward(self, x):
+        x = self.firstconv(x)
+        x = self.firstbn(x)
+        x = self.firstrelu(x)
+        x = self.firstmaxpool(x)
+        e1 = self.encoder1(x)
+        e2 = self.encoder2(e1)
+        e3 = self.encoder3(e2)
+        e3 = self.dblock(e3)
+
+        d3_g = self.decoder3_grass(e3) + e2
+        d2_g = self.decoder2_grass(d3_g) + e1
+        d1_g = self.decoder1_grass(d2_g)
+        out_g = self.finaldeconv1_grass(d1_g)
+        out_g = self.finalrelu1_grass(out_g)
+        out_g = self.finalconv2_grass(out_g)
+        out_g = self.finalrelu2_grass(out_g)
+        out_g = self.finalconv3_grass(out_g)
+        out_g = torch.sigmoid(out_g)
+
+        d3_v = self.decoder3_veg(e3) + e2
+        d2_v = self.decoder2_veg(d3_v) + e1
+        d1_v = self.decoder1_veg(d2_v)
+        out_v = self.finaldeconv1_veg(d1_v)
+        out_v = self.finalrelu1_veg(out_v)
+        out_v = self.finalconv2_veg(out_v)
+        out_v = self.finalrelu2_veg(out_v)
+        out_v = self.finalconv3_veg(out_v)
+        out_v = torch.sigmoid(out_v)
+
+        return out_g, out_v

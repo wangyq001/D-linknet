@@ -48,6 +48,10 @@ class DiceLoss(nn.Module):
         self.smooth = smooth
 
     def forward(self, pred, target):
+        if pred.dim() == 4:
+            pred = pred[:, 0, :, :]  # (B, 1, H, W) → (B, H, W)
+        if target.dim() == 4:
+            target = target[:, 0, :, :]
         pred = pred.flatten()
         target = target.flatten()
         intersection = torch.sum(pred * target)
@@ -122,6 +126,10 @@ class TverskyLoss(nn.Module):
         self.smooth = smooth
 
     def forward(self, pred, target):
+        if pred.dim() == 4:
+            pred = pred[:, 0, :, :]
+        if target.dim() == 4:
+            target = target[:, 0, :, :]
         pred = pred.flatten()
         target = target.flatten()
         tp = torch.sum(pred * target)
@@ -148,6 +156,10 @@ class FocalTverskyLoss(nn.Module):
         self.smooth = smooth
 
     def forward(self, pred, target):
+        if pred.dim() == 4:
+            pred = pred[:, 0, :, :]
+        if target.dim() == 4:
+            target = target[:, 0, :, :]
         pred = pred.flatten()
         target = target.flatten()
         tp = torch.sum(pred * target)
@@ -190,7 +202,7 @@ class ConditionalDiceLoss(nn.Module):
         self.connectivity_alpha = connectivity_alpha
 
     def _compute_boundary_weight(self, target_np):
-        """计算边界加权矩阵。返回 (H, W) numpy 数组，值域 (0, 1]。"""
+        """计算边界加权矩阵（CPU/numpy，仅用于生成固定权重图）。返回 (H, W) numpy 数组，值域 (0, 1]。"""
         target_np = (target_np * 255).astype(np.uint8)
         dist = cv2.distanceTransform(target_np, cv2.DIST_L2, 5)
         dist = dist / (self.boundary_sigma * 3)
@@ -199,7 +211,7 @@ class ConditionalDiceLoss(nn.Module):
         return weight
 
     def _compute_skeleton(self, binary_np):
-        """计算二值图像的骨架（morphological skeleton）。"""
+        """计算二值图像的骨架（CPU/numpy，仅用于生成固定权重图）。"""
         binary_np = binary_np.astype(np.uint8)
         if binary_np.sum() == 0:
             return binary_np.astype(np.float32)
@@ -216,49 +228,62 @@ class ConditionalDiceLoss(nn.Module):
                 break
         return skeleton.astype(np.float32)
 
-    def _dice(self, pred, target, weight_map=None):
-        """加权 Dice 计算。weight_map 为 (H,W) 矩阵或 None。"""
-        pred = pred.flatten()
-        target = target.flatten()
-        if weight_map is not None:
-            w = weight_map.flatten()
-            intersection = np.sum(pred * target * w)
-            union = np.sum(pred * w) + np.sum(target * w)
-        else:
-            intersection = np.sum(pred * target)
-            union = np.sum(pred) + np.sum(target)
-        score = (2.0 * intersection + self.smooth) / (union + self.smooth)
-        return 1.0 - score
-
     def forward(self, pred, target):
-        pred_np = pred.detach().cpu().numpy().squeeze()
-        target_np = target.detach().cpu().numpy().squeeze()
+        """所有模式的加权 Dice 计算均保留计算图，支持反向传播。
 
-        if pred_np.ndim == 3:
-            pred_np = pred_np[0]
-        if target_np.ndim == 3:
+        权重图（boundary / skeleton）从 target 派生，无需梯度；
+        pred 保持在 GPU tensor 上参与 Dice 计算，梯度正常回传。
+        """
+        # DataParallel 多卡：batch 维保留 GPU 数量
+        # batch=1 时去掉 batch 维；batch>1 时保留整 batch
+        if pred.dim() == 4:
+            if pred.shape[0] == 1:
+                pred = pred.squeeze(0)  # (1, C, H, W) → (C, H, W)
+            # batch>1 时保留不动
+
+        # target 也做对称处理
+        if target.dim() == 4:
+            if target.shape[0] == 1:
+                target = target.squeeze(0)
+
+        # numpy 转换：直接取第 0 张图（batch=1 时 squeeze 后只有一张；batch>1 时取第一张）
+        # DataParallel 下 batch_per_gpu=1，故 target_np[0] 就是当前处理的唯一一张图
+        target_np = target.detach().cpu().numpy()
+        if target_np.ndim == 4:
             target_np = target_np[0]
+        target_np = target_np.squeeze()
 
-        pred_binary = (pred_np > 0.5).astype(np.float32)
-        target_binary = target_np.astype(np.float32)
+        device = pred.device
+        weight_map = None
 
-        if self.mode is None:
-            return self._dice(pred_binary, target_binary)
-
-        elif self.mode == 'boundary':
-            weight_map = self._compute_boundary_weight(target_binary)
-            return self._dice(pred_binary, target_binary, weight_map)
+        if self.mode == 'boundary':
+            w_np = self._compute_boundary_weight(target_np)
+            weight_map = torch.from_numpy(w_np).to(device)
 
         elif self.mode == 'connectivity':
-            dice_loss = self._dice(pred_binary, target_binary)
-            skel_pred = self._compute_skeleton(pred_binary)
-            skel_target = self._compute_skeleton(target_binary)
-            skel_loss = self._dice(skel_pred, skel_target)
-            return (1 - self.connectivity_alpha) * dice_loss + self.connectivity_alpha * skel_loss
+            skel_np = self._compute_skeleton(target_np)
+            boundary_np = 1.0 - self._compute_boundary_weight(target_np)
+            w_np = (1 - self.connectivity_alpha) * boundary_np + self.connectivity_alpha * skel_np
+            weight_map = torch.from_numpy(w_np).to(device)
 
+        pred_flat = pred.flatten()
+        target_flat = target.flatten()
+
+        if weight_map is not None:
+            w = weight_map.flatten()
+            # weight_map 是从 target_np 的第一张图计算的，shape (H*W,)
+            # 当 batch>1 时，需要扩展 weight_map 以匹配完整的 pred_flat / target_flat
+            batch_size = pred_flat.numel() // w.numel()
+            if batch_size > 1:
+                w = w.unsqueeze(0).expand(batch_size, -1).reshape(-1)
+            intersection = torch.sum(pred_flat * target_flat * w)
+            union = torch.sum(pred_flat * w) + torch.sum(target_flat * w)
         else:
-            raise ValueError(f"ConditionalDiceLoss: unknown mode '{self.mode}', "
-                             f"must be None | 'boundary' | 'connectivity'")
+            intersection = torch.sum(pred_flat * target_flat)
+            union = torch.sum(pred_flat) + torch.sum(target_flat)
+
+        score = (2.0 * intersection + self.smooth) / (union + self.smooth)
+        return 1.0 - score.mean()
 
 
 # ================================================================

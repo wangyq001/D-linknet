@@ -36,12 +36,12 @@ MODEL_NAME = 'DinkNet34_less_pool_DualHead'
 IMAGE_DIR = '/root/autodl-tmp/DLinknet/D-linknet/dataset/val/images'
 
 # 模型权重文件路径（.th 或 .pth 格式）
-WEIGHT_PATH = '/root/autodl-tmp/DLinknet/D-linknet/weights/dink34_009_dual.th'
+WEIGHT_PATH = '/root/autodl-tmp/DLinknet/D-linknet/weights/dink34_015_dual.th'
 
 # 推理输出目录
 #   概率图：{OUTPUT_DIR}/{name}_prob.npy    float32, [0,1]
 #   二值掩码：{OUTPUT_DIR}/{name}_pred.png  uint8, 0/255
-OUTPUT_DIR = '/root/autodl-tmp/DLinknet/D-linknet/predictions/dink34_009_noTTA'
+OUTPUT_DIR = '/root/autodl-tmp/DLinknet/D-linknet/predictions/dink34_015_TTA'
 
 # 输入图像的目标尺寸，需与训练时 IMAGE_SHAPE 保持一致
 IMG_SHAPE = (1024, 1024)
@@ -49,13 +49,13 @@ IMG_SHAPE = (1024, 1024)
 # 是否启用测试时增强（TTA）
 #   True  = 启用 4-way TTA（与原作者 test.py 一致），精度更高，速度慢约 4 倍
 #   False = 禁用 TTA，单次推理，速度快
-TTA_ENABLE = False
+TTA_ENABLE = True
 # TTA_ENABLE = False
 
 # 二值化阈值：大于此值的像素判定为道路
 # 注意：TTA 输出经 /4.0 归一化后范围约 [0,1]，非 TTA 输出范围约 [0,1]
 #   归一化后阈值 0.25 ≈ 原作者原始阈值 1.0
-MASK_THRESHOLD = 0.8
+MASK_THRESHOLD = 0.75
 
 # --- 是否启用双头推理（草线 + 植被）
 # True = 推理双头模型，输出 grass_prob.npy, grass_pred.png, veg_prob.npy, veg_pred.png

@@ -43,7 +43,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.join(SCRIPT_DIR, 'dataset', 'train')
 
 # --- 实验名称：用于生成日志文件和模型权重的命名标识
-NAME = 'dink34_009'
+NAME = 'dink34_019'
 
 # --- TensorBoard 日志根目录
 TENSORBOARD_LOG_DIR = '/root/autodl-tmp/tf-logs'
@@ -56,12 +56,13 @@ BATCHSIZE_PER_CARD = 26
 
 # --- 初始学习率
 INITIAL_LR = 2e-4
+# INITIAL_LR = 3e-4
 
 # --- 最大训练轮数
 TOTAL_EPOCH = 300
 
 # --- 早停策略：连续多少个 epoch 损失未下降则停止训练
-EARLY_STOP_THRESHOLD = 10
+EARLY_STOP_THRESHOLD = 12
 
 # --- 学习率衰减触发：连续多少个 epoch 损失未下降后开始衰减
 LR_DECAY_THRESHOLD = 6
@@ -71,6 +72,7 @@ LR_MIN_BOUND = 3e-7
 
 # --- 学习率衰减因子（乘以旧学习率）；factor=True 时表示除以此值，=5.0 表示将学习率除以 5.0
 LR_DECAY_FACTOR = 3.0
+# LR_DECAY_FACTOR = 2.0
 
 # --- DataLoader 的 CPU 多进程加载线程数
 NUM_WORKERS = 20
@@ -109,7 +111,7 @@ LOSS_CONFIG = {
         'Tversky': 0.0,
         'FocalTversky': 0.0,
         # 草线（道路）推荐：连通性加权，防止道路断裂
-        'cDice': {'weight': 0.0, 'mode': 'boundary'},
+        'cDice': {'weight': 1.0, 'mode': 'boundary'},
     },
     'veg': {
         'Dice': 1.0,
@@ -128,9 +130,9 @@ LOSS_CONFIG = {
 #     beta (FN惩罚): 漏检惩罚系数，值越大越不能容忍漏检
 #     gamma(聚焦参数): 控制对难例的聚焦程度（仅 FocalTversky，γ<1 时放大难例损失）
 #     草线和植被均可使用，区别仅在于 LOSS_CONFIG 中各自分支的权重配置
-TVERSKY_ALPHA = 0.6
-TVERSKY_BETA  = 0.4
-TVERSKY_GAMMA = 0.75
+TVERSKY_ALPHA = 0.7
+TVERSKY_BETA  = 0.3
+TVERSKY_GAMMA = 0.7
 
 # --- 两阶段训练策略（渐进解冻 + 加权调度）
 #     WARMUP_EPOCHS: 植被分支冻结训练轮数，让共享 encoder+草线decoder 先收敛，防止植被分支破坏已学好的特征

@@ -43,7 +43,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.join(SCRIPT_DIR, 'dataset', 'train')
 
 # --- 实验名称：用于生成日志文件和模型权重的命名标识
-NAME = 'dink34_019'
+NAME = 'dink34_028'
 
 # --- TensorBoard 日志根目录
 TENSORBOARD_LOG_DIR = '/root/autodl-tmp/tf-logs'
@@ -107,17 +107,25 @@ LOSS_CONFIG = {
         'Dice': 1.0,
         'BCE': 1.0,
         'Focal': 0.0,
-        'FocalBCE': 0.0,
+        'FocalBCE': 1.0,
         'Tversky': 0.0,
         'FocalTversky': 0.0,
-        # 草线（道路）推荐：连通性加权，防止道路断裂
-        'cDice': {'weight': 1.0, 'mode': 'boundary'},
+        # cDice: 连通性加权，防止道路断裂
+        #   - mode='boundary': 边界加权，适合植被/团块
+        #   - mode='connectivity': 连通性加权，适合道路/管线
+        #   - 支持键：weight(权重), mode, sigma(boundary专用), alpha(connectivity专用)
+        'cDice': {'weight': 0.0, 'mode': 'boundary'},
+        # GridLoss: 网格专项损失（方向一致性 + 交叉点感知）
+        #   - direction_weight: 方向一致性权重（0 表示不使用）
+        #   - junction_weight:  交叉点感知权重（0 表示不使用）
+        #   - junction_penalty: 交叉点 BCE 加权倍率
+        'GridLoss': {'weight': 0.0, 'direction_weight': 1.0, 'junction_weight': 1.0, 'junction_penalty': 2.0},
     },
     'veg': {
-        'Dice': 1.0,
-        'BCE': 1.0,
+        'Dice': 0.0,
+        'BCE': 0.0,
         'Focal': 0.0,
-        'FocalBCE': 0.0,
+        'FocalBCE': 1.0,
         'Tversky': 0.0,
         'FocalTversky': 0.0,
         # 植被（团块）推荐：边界加权，改善边缘质量
@@ -130,8 +138,8 @@ LOSS_CONFIG = {
 #     beta (FN惩罚): 漏检惩罚系数，值越大越不能容忍漏检
 #     gamma(聚焦参数): 控制对难例的聚焦程度（仅 FocalTversky，γ<1 时放大难例损失）
 #     草线和植被均可使用，区别仅在于 LOSS_CONFIG 中各自分支的权重配置
-TVERSKY_ALPHA = 0.7
-TVERSKY_BETA  = 0.3
+TVERSKY_ALPHA = 0.6
+TVERSKY_BETA  = 0.4
 TVERSKY_GAMMA = 0.7
 
 # --- 两阶段训练策略（渐进解冻 + 加权调度）
@@ -372,19 +380,20 @@ print(f'[Dataset] Sample ids: {trainlist[:3]} ...')
 # ---------- 双头 vs 单头分支 ----------
 if ENABLE_DUAL_HEAD:
     from loss import FocalTverskyLoss
+    loss_kwargs = {
+        'Tversky': {
+            'alpha': TVERSKY_ALPHA,
+            'beta': TVERSKY_BETA,
+        },
+        'FocalTversky': {
+            'alpha': TVERSKY_ALPHA,
+            'beta': TVERSKY_BETA,
+            'gamma': TVERSKY_GAMMA,
+        }
+    }
     loss_fn = lambda: ConfigurableDualTaskLoss(
         LOSS_CONFIG,
-        loss_kwargs={
-            'Tversky': {
-                'alpha': TVERSKY_ALPHA,
-                'beta': TVERSKY_BETA,
-            },
-            'FocalTversky': {
-                'alpha': TVERSKY_ALPHA,
-                'beta': TVERSKY_BETA,
-                'gamma': TVERSKY_GAMMA,
-            }
-        }
+        loss_kwargs=loss_kwargs,
     )
     solver = MyFrame(DUAL_HEAD_BASE_MODEL, loss_fn, INITIAL_LR)
     batchsize = torch.cuda.device_count() * max(1, BATCHSIZE_PER_CARD // 2)
@@ -429,11 +438,12 @@ if ENABLE_DUAL_HEAD:
         'epoch', 'time_s', 'lr', 'veg_weight',
         'train_loss_total', 'train_loss_grass', 'train_loss_veg',
         'train_grass_bce', 'train_grass_dice', 'train_grass_ft', 'train_grass_cdice',
+        'train_grass_dir', 'train_grass_junc',
         'train_veg_bce', 'train_veg_dice', 'train_veg_ft', 'train_veg_cdice',
         'train_grass_acc', 'train_grass_recall', 'train_grass_iou', 'train_grass_f1',
         'train_veg_acc', 'train_veg_recall', 'train_veg_iou', 'train_veg_f1',
         'val_loss_total', 'val_loss_grass', 'val_loss_veg',
-        'val_grass_cdice', 'val_veg_cdice',
+        'val_grass_cdice',
         'val_grass_acc', 'val_grass_recall', 'val_grass_iou', 'val_grass_f1',
         'val_veg_acc', 'val_veg_recall', 'val_veg_iou', 'val_veg_f1',
         'val_miou', 'no_optim',
@@ -630,6 +640,8 @@ for epoch in range(1, TOTAL_EPOCH + 1):
         train_grass_dice_sum = 0.0
         train_grass_ft_sum = 0.0
         train_grass_cdice_sum = 0.0
+        train_grass_dir_sum = 0.0
+        train_grass_junc_sum = 0.0
         train_veg_bce_sum = 0.0
         train_veg_dice_sum = 0.0
         train_veg_ft_sum = 0.0
@@ -655,6 +667,8 @@ for epoch in range(1, TOTAL_EPOCH + 1):
             train_grass_dice_sum += bd_g.get('Dice', 0.0)
             train_grass_ft_sum += bd_g.get('FocalTversky', 0.0)
             train_grass_cdice_sum += bd_g.get('cDice', 0.0)
+            train_grass_dir_sum += bd_g.get('direction', 0.0)
+            train_grass_junc_sum += bd_g.get('junction', 0.0)
             train_veg_bce_sum += bd_v.get('BCE', 0.0)
             train_veg_dice_sum += bd_v.get('Dice', 0.0)
             train_veg_ft_sum += bd_v.get('FocalTversky', 0.0)
@@ -687,6 +701,8 @@ for epoch in range(1, TOTAL_EPOCH + 1):
         train_grass_dice = train_grass_dice_sum / n
         train_grass_ft = train_grass_ft_sum / n
         train_grass_cdice = train_grass_cdice_sum / n
+        train_grass_dir = train_grass_dir_sum / n
+        train_grass_junc = train_grass_junc_sum / n
         train_veg_bce = train_veg_bce_sum / n
         train_veg_dice = train_veg_dice_sum / n
         train_veg_ft = train_veg_ft_sum / n
@@ -786,6 +802,8 @@ for epoch in range(1, TOTAL_EPOCH + 1):
         writer.add_scalar('Loss/grass/train_dice', train_grass_dice, epoch)
         writer.add_scalar('Loss/grass/train_ft', train_grass_ft, epoch)
         writer.add_scalar('Loss/grass/train_cdice', train_grass_cdice, epoch)
+        writer.add_scalar('Loss/grass/train_dir', train_grass_dir, epoch)
+        writer.add_scalar('Loss/grass/train_junc', train_grass_junc, epoch)
         writer.add_scalar('Loss/grass/val_total', val_loss_grass, epoch)
         writer.add_scalar('Loss/grass/val_bce', val_grass_bce, epoch)
         writer.add_scalar('Loss/grass/val_dice', val_grass_dice, epoch)
@@ -834,11 +852,12 @@ for epoch in range(1, TOTAL_EPOCH + 1):
             epoch, elapsed, current_lr, veg_weight,
             train_loss_total, train_loss_grass, train_loss_veg,
             train_grass_bce, train_grass_dice, train_grass_ft, train_grass_cdice,
+            train_grass_dir, train_grass_junc,
             train_veg_bce, train_veg_dice, train_veg_ft, train_veg_cdice,
             train_g_acc, train_g_recall, train_g_iou, train_g_f1,
             train_v_acc, train_v_recall, train_v_iou, train_v_f1,
             val_loss_total, val_loss_grass, val_loss_veg,
-            val_grass_cdice, val_veg_cdice,
+            val_grass_cdice,
             val_g_acc, val_g_recall, val_g_iou, val_g_f1,
             val_v_acc, val_v_recall, val_v_iou, val_v_f1,
             val_miou, no_optim,
@@ -850,8 +869,9 @@ for epoch in range(1, TOTAL_EPOCH + 1):
         print('veg_weight={:.4f}  lr={}'.format(veg_weight, current_lr), file=mylog)
         print('train: total={:.6f}  grass={:.6f}  veg={:.6f}'.format(
             train_loss_total, train_loss_grass, train_loss_veg), file=mylog)
-        print('train grass: acc={:.4f} recall={:.4f} iou={:.4f} f1={:.4f}  cDice={:.6f}'.format(
-            train_g_acc, train_g_recall, train_g_iou, train_g_f1, train_grass_cdice), file=mylog)
+        print('train grass: acc={:.4f} recall={:.4f} iou={:.4f} f1={:.4f}  cDice={:.6f}  dir={:.6f}  junc={:.6f}'.format(
+            train_g_acc, train_g_recall, train_g_iou, train_g_f1,
+            train_grass_cdice, train_grass_dir, train_grass_junc), file=mylog)
         print('train veg:   acc={:.4f} recall={:.4f} iou={:.4f} f1={:.4f}  cDice={:.6f}'.format(
             train_v_acc, train_v_recall, train_v_iou, train_v_f1, train_veg_cdice), file=mylog)
         print('val:   total={:.6f}  grass={:.6f}  veg={:.6f}'.format(
@@ -866,8 +886,9 @@ for epoch in range(1, TOTAL_EPOCH + 1):
         print('veg_weight={:.4f}  lr={}'.format(veg_weight, current_lr))
         print('train: total={:.6f}  grass={:.6f}  veg={:.6f}'.format(
             train_loss_total, train_loss_grass, train_loss_veg))
-        print('train grass: acc={:.4f} recall={:.4f} iou={:.4f} f1={:.4f}  cDice={:.6f}'.format(
-            train_g_acc, train_g_recall, train_g_iou, train_g_f1, train_grass_cdice))
+        print('train grass: acc={:.4f} recall={:.4f} iou={:.4f} f1={:.4f}  cDice={:.6f}  dir={:.6f}  junc={:.6f}'.format(
+            train_g_acc, train_g_recall, train_g_iou, train_g_f1,
+            train_grass_cdice, train_grass_dir, train_grass_junc))
         print('train veg:   acc={:.4f} recall={:.4f} iou={:.4f} f1={:.4f}  cDice={:.6f}'.format(
             train_v_acc, train_v_recall, train_v_iou, train_v_f1, train_veg_cdice))
         print('val:   total={:.6f}  grass={:.6f}  veg={:.6f}'.format(

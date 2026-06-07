@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 import cv2
 import numpy as np
@@ -287,6 +288,169 @@ class ConditionalDiceLoss(nn.Module):
 
 
 # ================================================================
+# 草方格网格专用损失：GridLoss
+# 适用于两个方向近似正交（差≈90°）的规则网格结构
+# ================================================================
+
+class GridLoss(nn.Module):
+    """
+    草方格专用复合损失函数。
+
+    L_grid = λ_dir * L_direction + λ_junc * L_junction
+
+    两个正交组件：
+      L_direction  — 正交方向一致性（空间梯度域）
+                     核心：梯度角度折叠到 [0, π/2]，正交方向折叠后重合
+      L_junction   — 交叉点感知（形态学域）
+                     核心：GT 交叉点位置的 BCE 加权惩罚
+
+    适用角度示例：10°/100°、30°/120°、46°/135°、75°/168° 等任意正交角度对。
+    不预设具体方向，从 GT 动态适配。
+
+    forward 返回 dict，支持 return_components=True 查看各分量：
+    {
+        'total':     总损失（用于反向传播），
+        'direction': 方向一致性损失值，
+        'junction':  交叉点感知损失值，
+    }
+    """
+
+    def __init__(
+        self,
+        direction_weight=0.5,
+        junction_weight=0.5,
+        junction_penalty=3.0,
+        threshold=0.5,
+    ):
+        super().__init__()
+        self.direction_weight = direction_weight
+        self.junction_weight = junction_weight
+        self.junction_penalty = junction_penalty
+        self.threshold = threshold
+
+        # Sobel 核（用于计算梯度方向）
+        sobel_x = torch.tensor([
+            [-1, 0, 1],
+            [-2, 0, 2],
+            [-1, 0, 1]
+        ], dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+        self.register_buffer('_sobel_x', sobel_x)
+        self.register_buffer('_sobel_y', sobel_x.transpose(-1, -2))
+
+        # 交叉点检测：十字形结构元素
+        cross = torch.tensor([
+            [0, 1, 0],
+            [1, 1, 1],
+            [0, 1, 0]
+        ], dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+        self.register_buffer('_cross_kernel', cross)
+
+        # 交叉点检测：水平/竖直膨胀核
+        h_ker = torch.ones(1, 1, 1, 5, dtype=torch.float32)
+        v_ker = torch.ones(1, 1, 5, 1, dtype=torch.float32)
+        self.register_buffer('_h_dilate_ker', h_ker)
+        self.register_buffer('_v_dilate_ker', v_ker)
+
+        # 折叠宽度：π/2，两个正交方向折叠后应完全重合
+        self._fold_width = np.pi / 2
+
+    def _gradient_angle(self, binary):
+        """计算二值掩码的梯度角度场 ∈ [0, 2π)"""
+        sobel_x = self._sobel_x.to(binary.device)
+        sobel_y = self._sobel_y.to(binary.device)
+        Gx = F.conv2d(binary, sobel_x, padding=1)
+        Gy = F.conv2d(binary, sobel_y, padding=1)
+        return torch.atan2(Gy, Gx) % (2 * np.pi)
+
+    def _fold_angle(self, angle):
+        """折叠到 [0, fold_width]，使正交方向映射为同一值"""
+        return torch.remainder(angle, self._fold_width)
+
+    def _direction_loss(self, pred_binary, target_binary):
+        """
+        正交方向一致性损失（梯度域）。
+        原理：将 pred 和 target 的梯度角度都折叠到 [0, π/2]，
+        折叠后方向一致性的差异即为损失值。
+        """
+        sobel_x = self._sobel_x.to(pred_binary.device)
+        sobel_y = self._sobel_y.to(pred_binary.device)
+        pred_angle = self._fold_angle(self._gradient_angle(pred_binary))
+        target_angle = self._fold_angle(self._gradient_angle(target_binary))
+
+        diff = torch.abs(pred_angle - target_angle)
+        diff = torch.min(diff, self._fold_width - diff)
+        diff = diff / (self._fold_width / 2)  # 归一化到 [0, 1]
+
+        # 仅在线段区域计算（避免背景噪声干扰）
+        pred_mag = torch.sqrt(
+            F.conv2d(pred_binary, sobel_x, padding=1) ** 2 +
+            F.conv2d(pred_binary, sobel_y, padding=1) ** 2
+        )
+        target_mag = torch.sqrt(
+            F.conv2d(target_binary, sobel_x, padding=1) ** 2 +
+            F.conv2d(target_binary, sobel_y, padding=1) ** 2
+        )
+        line_mask = (pred_mag > 0.1) * (target_mag > 0.1)
+
+        loss = (diff * line_mask.squeeze(1).float()).sum()
+        num = line_mask.sum().clamp(min=1.0)
+        return loss / num
+
+    def _detect_junctions(self, binary):
+        """
+        交叉点检测（形态学法）：
+        交叉点 = 水平膨胀 ⊙ 竖直膨胀 ⊙ 原始掩码 ⊙ 十字确认（邻域 ≥ 4）
+        """
+        h_ker = self._h_dilate_ker.to(binary.device)
+        v_ker = self._v_dilate_ker.to(binary.device)
+        cross = self._cross_kernel.to(binary.device)
+        dilated_h = F.conv2d(binary, h_ker, padding=(0, 2))
+        dilated_v = F.conv2d(binary, v_ker, padding=(2, 0))
+        junctions = dilated_h * dilated_v * binary
+        neighbor_cnt = F.conv2d(binary.float(), cross, padding=1)
+        junctions = junctions * (neighbor_cnt >= 4).float()
+        return junctions
+
+    def _junction_loss(self, pred, target):
+        """
+        交叉点感知损失（形态学域）。
+        原理：GT 交叉点位置的 BCE 应用 junction_penalty 加权，
+        交叉点是网格拓扑的核心节点，预测错误代价更高。
+        """
+        target_binary = target.float()
+        target_junctions = self._detect_junctions(target_binary)
+
+        bce = F.binary_cross_entropy(pred, target, reduction='none')
+        bce = bce.squeeze(1)
+
+        weight_map = torch.ones_like(bce)
+        j_mask = target_junctions.squeeze(1)
+        weight_map = torch.where(
+            j_mask > 0.5,
+            weight_map * self.junction_penalty,
+            weight_map
+        )
+        return (bce * weight_map).mean()
+
+    def forward(self, pred, target, return_components=False):
+        pred_binary = (pred > self.threshold).float()
+        target_binary = target.float()
+
+        dir_val = self._direction_loss(pred_binary, target_binary)
+        junc_val = self._junction_loss(pred, target)
+
+        total = self.direction_weight * dir_val + self.junction_weight * junc_val
+
+        if return_components:
+            return {
+                'total': total,
+                'direction': dir_val.item(),
+                'junction': junc_val.item(),
+            }
+        return total
+
+
+# ================================================================
 # 可配置双任务损失：ConfigurableDualTaskLoss
 # ================================================================
 
@@ -325,6 +489,15 @@ class ConfigurableDualTaskLoss(nn.Module):
             'Tversky': {'alpha': 0.5, 'beta': 0.5},
             'Focal': {'alpha': 0.25, 'gamma': 2.0},
         }
+
+    GridLoss dict 格式（写在 LOSS_CONFIG 的 grass 分支下）:
+        'GridLoss': {
+            'weight':           0.0,           # 损失总权重，0=不使用（默认）
+            'direction_weight': 0.5,           # 方向一致性权重
+            'junction_weight':  0.5,           # 交叉点感知权重
+            'junction_penalty':  3.0,           # 交叉点 BCE 加权倍率
+        }
+        例如开启: 'GridLoss': {'weight': 0.5, 'direction_weight': 0.5, 'junction_weight': 0.5, 'junction_penalty': 3.0}
 
     forward 返回 dict:
         {
@@ -368,6 +541,7 @@ class ConfigurableDualTaskLoss(nn.Module):
         }
 
         self._branch_cdice = {}
+        self._branch_gridloss = {}
         for branch in ('grass', 'veg'):
             branch_cfg = loss_config.get(branch, {})
             cdice_cfg = branch_cfg.get('cDice', 0.0)
@@ -383,6 +557,16 @@ class ConfigurableDualTaskLoss(nn.Module):
                 mode=mode, boundary_sigma=sigma, connectivity_alpha=alpha
             )
 
+            grid_cfg = branch_cfg.get('GridLoss', 0.0)
+            if isinstance(grid_cfg, dict):
+                self._branch_gridloss[branch] = GridLoss(
+                    direction_weight=grid_cfg.get('direction_weight', 0.5),
+                    junction_weight=grid_cfg.get('junction_weight', 0.5),
+                    junction_penalty=grid_cfg.get('junction_penalty', 3.0),
+                )
+            else:
+                self._branch_gridloss[branch] = GridLoss()
+
     def _parse_weight(self, raw):
         if isinstance(raw, dict):
             return raw.get('weight', 0.0), raw
@@ -397,11 +581,18 @@ class ConfigurableDualTaskLoss(nn.Module):
                 continue
             if loss_name == 'cDice':
                 loss_fn = self._branch_cdice[branch_name]
+            elif loss_name == 'GridLoss':
+                loss_fn = self._branch_gridloss[branch_name]
             else:
                 loss_fn = self.loss_registry[loss_name]
             val = loss_fn(pred, target)
             total = total + weight * val
-            breakdown[loss_name] = val.item() if hasattr(val, 'item') else val
+            if loss_name == 'GridLoss' and isinstance(val, dict):
+                breakdown['direction'] = val.get('direction', 0.0)
+                breakdown['junction'] = val.get('junction', 0.0)
+                breakdown[loss_name] = val.get('total', 0.0)
+            else:
+                breakdown[loss_name] = val.item() if hasattr(val, 'item') else val
         return total, breakdown
 
     def forward(self, pred_grass, target_grass, pred_veg, target_veg):

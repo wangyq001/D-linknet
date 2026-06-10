@@ -44,7 +44,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.join(SCRIPT_DIR, 'dataset', 'train')
 
 # --- 实验名称：用于生成日志文件和模型权重的命名标识
-NAME = 'dink34_032'
+NAME = 'dink34_033'
 
 # --- TensorBoard 日志根目录
 TENSORBOARD_LOG_DIR = '/root/autodl-tmp/tf-logs'
@@ -127,7 +127,7 @@ LOSS_CONFIG = {
         # FAL: 频域感知损失（参考 FreqU-FNet 论文，arXiv:2505.17544）
         #   - weight: FAL 总权重（0 表示不使用）
         #   - wavelet: 小波基，默认为 'db4'
-        'FAL': {'weight': 0, 'wavelet': 'db4'},
+        'FAL': {'weight': 1, 'wavelet': 'db4'},
     },
     'veg': {
         'Dice': 1.0,
@@ -139,7 +139,7 @@ LOSS_CONFIG = {
         # 植被（团块）推荐：边界加权，改善边缘质量
         'cDice': {'weight': 0.0, 'mode': 'connectivity'},
         # FAL: 频域感知损失
-        'FAL': {'weight': 0, 'wavelet': 'db4'},
+        'FAL': {'weight': 1, 'wavelet': 'db4'},
     },
 }
 

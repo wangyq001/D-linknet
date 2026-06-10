@@ -4,6 +4,7 @@ import torch.nn.functional as F
 
 import cv2
 import numpy as np
+import pywt
 class dice_bce_loss(nn.Module):
     def __init__(self, batch=True):
         super(dice_bce_loss, self).__init__()
@@ -567,6 +568,15 @@ class ConfigurableDualTaskLoss(nn.Module):
             else:
                 self._branch_gridloss[branch] = GridLoss()
 
+        # 从 loss_config 中解析 FAL 配置
+        grass_fal = loss_config.get('grass', {}).get('FAL', {})
+        veg_fal = loss_config.get('veg', {}).get('FAL', {})
+        self.fal_weight_grass = grass_fal.get('weight', 0.0) if isinstance(grass_fal, dict) else float(grass_fal)
+        self.fal_weight_veg = veg_fal.get('weight', 0.0) if isinstance(veg_fal, dict) else float(veg_fal)
+        self.fal_wavelet = grass_fal.get('wavelet', 'db4') if isinstance(grass_fal, dict) else 'db4'
+        self._fal_grass = None
+        self._fal_veg = None
+
     def _parse_weight(self, raw):
         if isinstance(raw, dict):
             return raw.get('weight', 0.0), raw
@@ -583,6 +593,10 @@ class ConfigurableDualTaskLoss(nn.Module):
                 loss_fn = self._branch_cdice[branch_name]
             elif loss_name == 'GridLoss':
                 loss_fn = self._branch_gridloss[branch_name]
+            elif loss_name == 'FAL':
+                # FAL 由 forward 中统一处理，这里只记录权重信息
+                breakdown[loss_name] = 0.0
+                continue
             else:
                 loss_fn = self.loss_registry[loss_name]
             val = loss_fn(pred, target)
@@ -604,7 +618,28 @@ class ConfigurableDualTaskLoss(nn.Module):
         veg_loss, veg_breakdown = self._compute_branch_loss(
             pred_veg, target_veg, veg_cfg, 'veg'
         )
-        total_loss = grass_loss + veg_loss
+
+        L_freq = 0.0
+        if self.fal_weight_grass > 0:
+            if self._fal_grass is None:
+                self._fal_grass = FrequencyAwareLoss(wavelet=self.fal_wavelet,
+                                                     weight=self.fal_weight_grass)
+            L_fal_g = self._fal_grass(pred_grass, target_grass)
+            L_freq = L_freq + L_fal_g
+            grass_breakdown['FAL'] = L_fal_g.item()
+        else:
+            grass_breakdown['FAL'] = 0.0
+        if self.fal_weight_veg > 0:
+            if self._fal_veg is None:
+                self._fal_veg = FrequencyAwareLoss(wavelet=self.fal_wavelet,
+                                                    weight=self.fal_weight_veg)
+            L_fal_v = self._fal_veg(pred_veg, target_veg)
+            L_freq = L_freq + L_fal_v
+            veg_breakdown['FAL'] = L_fal_v.item()
+        else:
+            veg_breakdown['FAL'] = 0.0
+
+        total_loss = grass_loss + veg_loss + L_freq
         return {
             'total': total_loss,
             'grass': grass_loss,
@@ -612,3 +647,61 @@ class ConfigurableDualTaskLoss(nn.Module):
             'grass_breakdown': grass_breakdown,
             'veg_breakdown': veg_breakdown,
         }
+
+
+# ================================================================
+# 频域感知损失（参考 FreqU-FNet 论文，arXiv:2505.17544）
+# ================================================================
+
+class FrequencyAwareLoss(nn.Module):
+    """
+    频域感知损失（Frequency-Aware Loss, FAL）。
+
+    参考 FreqU-FNet 论文（arXiv:2505.17544），公式 9-14
+    通过小波变换（DWT）提取预测图和标签的高频子带，
+    计算高频子带之间的 L1 损失，直接监督边缘和纹理细节。
+
+    使用 Daubechies-4 (db4) 小波基：比 Haar 有更好的正则性，
+    对平滑边缘重建质量更高，FreqU-FNet 论文推荐使用 db4。
+    """
+    def __init__(self, wavelet='db4', level=1, weight=0.2):
+        super().__init__()
+        self.wavelet = wavelet
+        self.level = level
+        self.weight = weight
+
+    def forward(self, pred, target):
+        if pred.dim() == 4:
+            pred = pred[:, 0, :, :]
+        if target.dim() == 4:
+            target = target[:, 0, :, :]
+
+        batch_size = pred.size(0)
+        total_loss = 0.0
+
+        for b in range(batch_size):
+            p = pred[b].cpu().detach().numpy()
+            t = target[b].cpu().detach().numpy()
+
+            coeffs_p = pywt.dwt2(p, self.wavelet)
+            coeffs_t = pywt.dwt2(t, self.wavelet)
+
+            _, (p_LH, p_HL, p_HH) = coeffs_p
+            _, (t_LH, t_HL, t_HH) = coeffs_t
+
+            p_LH_t = torch.from_numpy(p_LH).to(pred.device)
+            p_HL_t = torch.from_numpy(p_HL).to(pred.device)
+            p_HH_t = torch.from_numpy(p_HH).to(pred.device)
+            t_LH_t = torch.from_numpy(t_LH).to(target.device)
+            t_HL_t = torch.from_numpy(t_HL).to(target.device)
+            t_HH_t = torch.from_numpy(t_HH).to(target.device)
+
+            l_lh = torch.abs(p_LH_t - t_LH_t).mean()
+            l_hl = torch.abs(p_HL_t - t_HL_t).mean()
+            l_hh = torch.abs(p_HH_t - t_HH_t).mean()
+            loss_freq = (l_lh + l_hl + l_hh) / 3.0
+
+            total_loss += loss_freq
+
+        avg_loss = total_loss / batch_size
+        return self.weight * avg_loss

@@ -24,7 +24,7 @@ import cv2
 # =============================================================================
 
 # 推理输出目录（evaluate_inference.py 的 OUTPUT_DIR）
-PRED_DIR = '/root/autodl-tmp/DLinknet/D-linknet/predictions/dink34_018_TTA'
+PRED_DIR = '/root/autodl-tmp/DLinknet/D-linknet/predictions/dink34_0311_TTA'
 
 # 是否为双头模式（草线 + 植被）
 #   True  = 双头评估，输出 grass/ 和 veg/ 两套指标

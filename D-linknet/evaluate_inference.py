@@ -30,18 +30,18 @@ import torch
 
 # --- 模型名称：需与 networks/dinknet.py 中定义的类名一致
 #   可选: DinkNet34 / DinkNet34_less_pool / DinkNet50 / DinkNet101 / LinkNet34
-MODEL_NAME = 'DinkNet34_less_pool_DualHead'
+MODEL_NAME = 'DinkNet34_less_pool_DualHead_Freq'
 
 # 推理图像所在目录（支持 .tif / .jpg / .png，自动识别，排除 _mask 文件）
 IMAGE_DIR = '/root/autodl-tmp/DLinknet/D-linknet/dataset/val/images'
 
 # 模型权重文件路径（.th 或 .pth 格式）
-WEIGHT_PATH = '/root/autodl-tmp/DLinknet/D-linknet/weights/dink34_015_dual.th'
+WEIGHT_PATH = '/root/autodl-tmp/DLinknet/D-linknet/weights/dink34_031_dual_Freq.th'
 
 # 推理输出目录
 #   概率图：{OUTPUT_DIR}/{name}_prob.npy    float32, [0,1]
 #   二值掩码：{OUTPUT_DIR}/{name}_pred.png  uint8, 0/255
-OUTPUT_DIR = '/root/autodl-tmp/DLinknet/D-linknet/predictions/dink34_015_TTA'
+OUTPUT_DIR = '/root/autodl-tmp/DLinknet/D-linknet/predictions/dink34_0311_TTA'
 
 # 输入图像的目标尺寸，需与训练时 IMAGE_SHAPE 保持一致
 IMG_SHAPE = (1024, 1024)
@@ -55,7 +55,7 @@ TTA_ENABLE = True
 # 二值化阈值：大于此值的像素判定为道路
 # 注意：TTA 输出经 /4.0 归一化后范围约 [0,1]，非 TTA 输出范围约 [0,1]
 #   归一化后阈值 0.25 ≈ 原作者原始阈值 1.0
-MASK_THRESHOLD = 0.75
+MASK_THRESHOLD = 0.8
 
 # --- 是否启用双头推理（草线 + 植被）
 # True = 推理双头模型，输出 grass_prob.npy, grass_pred.png, veg_prob.npy, veg_pred.png
@@ -63,9 +63,10 @@ DUAL_HEAD = True
 
 # --- 双头推理时需要配置的模型名称
 # 可选: DinkNet34_DualHead / LinkNet34_DualHead / DinkNet50_DualHead /
-#       DinkNet101_DualHead / DinkNet34_less_pool_DualHead
+#       DinkNet101_DualHead / DinkNet34_less_pool_DualHead /
+#       DinkNet34_less_pool_DualHead_Freq
 # 仅在 DUAL_HEAD=True 时使用
-DUAL_HEAD_MODEL_NAME = 'DinkNet34_less_pool_DualHead'
+DUAL_HEAD_MODEL_NAME = 'DinkNet34_less_pool_DualHead_Freq'
 
 
 def build_net():
@@ -74,6 +75,7 @@ def build_net():
         DinkNet34, DinkNet34_less_pool, DinkNet50, DinkNet101, LinkNet34,
         DinkNet34_DualHead, LinkNet34_DualHead, DinkNet50_DualHead,
         DinkNet101_DualHead, DinkNet34_less_pool_DualHead,
+        DinkNet34_less_pool_DualHead_Freq,
     )
 
     if DUAL_HEAD:
@@ -83,6 +85,7 @@ def build_net():
             'DinkNet50_DualHead': DinkNet50_DualHead,
             'DinkNet101_DualHead': DinkNet101_DualHead,
             'DinkNet34_less_pool_DualHead': DinkNet34_less_pool_DualHead,
+            'DinkNet34_less_pool_DualHead_Freq': DinkNet34_less_pool_DualHead_Freq,
         }
         model_name = DUAL_HEAD_MODEL_NAME
     else:

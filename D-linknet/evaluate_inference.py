@@ -36,12 +36,12 @@ MODEL_NAME = 'DinkNet34_less_pool_DualHead_Freq'
 IMAGE_DIR = '/root/autodl-tmp/DLinknet/D-linknet/dataset/val/images'
 
 # 模型权重文件路径（.th 或 .pth 格式）
-WEIGHT_PATH = '/root/autodl-tmp/DLinknet/D-linknet/weights/dink34_032_dual_Freq.th'
+WEIGHT_PATH = '/root/autodl-tmp/DLinknet/D-linknet/weights/dink34_045_dual_Freq.th'
 
 # 推理输出目录
 #   概率图：{OUTPUT_DIR}/{name}_prob.npy    float32, [0,1]
 #   二值掩码：{OUTPUT_DIR}/{name}_pred.png  uint8, 0/255
-OUTPUT_DIR = '/root/autodl-tmp/DLinknet/D-linknet/predictions/dink34_032_TTA'
+OUTPUT_DIR = '/root/autodl-tmp/DLinknet/D-linknet/predictions/dink34_045_TTA'
 
 # 输入图像的目标尺寸，需与训练时 IMAGE_SHAPE 保持一致
 IMG_SHAPE = (1024, 1024)

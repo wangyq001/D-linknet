@@ -4,14 +4,38 @@ import torch.nn as nn
 import cv2
 import numpy as np
 
+
 class MyFrame():
-    def __init__(self, net, loss, lr=2e-4, evalmode=False):
+    def __init__(self, net, loss, lr=2e-4, evalmode=False, use_amp=True, amp_dtype=torch.float16):
+        """
+        Args:
+            net:        模型类（class），实例化时调用 net()
+            loss:       损失函数类（class），实例化时调用 loss()
+            lr:         初始学习率
+            evalmode:   True 时把所有 BatchNorm 固定在 eval 模式
+            use_amp:    True 时使用 torch.cuda.amp 自动混合精度训练（默认 True）
+            amp_dtype:  autocast 用的低精度 dtype，默认 fp16；CPU/GPU 不支持 fp16 时退化为 bf16
+        """
         self.net = net().cuda()
         self.net = torch.nn.DataParallel(self.net, device_ids=range(torch.cuda.device_count()))
         self.optimizer = torch.optim.Adam(params=self.net.parameters(), lr=lr)
         #self.optimizer = torch.optim.RMSprop(params=self.net.parameters(), lr=lr)
         self.loss = loss()
         self.old_lr = lr
+        # ---- AMP 配置 ----
+        # 优先 fp16；若当前 CUDA 不支持 fp16（如 V100/A100 之前的卡），则使用 bf16。
+        # GradScaler 仅对 fp16 有意义（bf16 不需要 scaler）。
+        self.use_amp = bool(use_amp) and torch.cuda.is_available()
+        if self.use_amp:
+            if amp_dtype == torch.float16 and not torch.cuda.is_available():
+                self.amp_dtype = torch.bfloat16
+            else:
+                self.amp_dtype = amp_dtype
+            # GradScaler 仅在 fp16 时启用；bf16 动态范围够大，不需要 scaler
+            self.scaler = torch.amp.GradScaler('cuda', enabled=(self.amp_dtype == torch.float16))
+        else:
+            self.amp_dtype = torch.float32
+            self.scaler = torch.amp.GradScaler('cuda', enabled=False)
         if evalmode:
             for i in self.net.modules():
                 if isinstance(i, nn.BatchNorm2d):
@@ -60,12 +84,17 @@ class MyFrame():
             self.mask_veg = self.mask_veg.cuda()
 
     def optimize(self):
+        """单头训练一步。返回 (total_loss, bce_loss, dice_loss, pred)。已启用 AMP。"""
         self.forward()
         self.optimizer.zero_grad()
-        pred = self.net.forward(self.img)
-        total_loss, bce_loss, dice_loss = self.loss(self.mask, pred)
-        total_loss.backward()
-        self.optimizer.step()
+        # autocast 包住前向；损失计算放进 autocast 区，以保持 logits 与 loss 的 dtype 一致
+        with torch.amp.autocast('cuda', enabled=self.use_amp, dtype=self.amp_dtype):
+            pred = self.net.forward(self.img)
+            total_loss, bce_loss, dice_loss = self.loss(self.mask, pred)
+        # scaler.scale 之后 backward；scaler.step 调用 optimizer.step（自动 unscale + 跳过 inf/nan）
+        self.scaler.scale(total_loss).backward()
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
         return total_loss, bce_loss, dice_loss, pred
 
     def save(self, path):
@@ -189,19 +218,21 @@ class MyFrame():
                 'grass_breakdown': dict,
                 'veg_breakdown': dict,
             }
+        已启用 AMP（autocast + GradScaler）。
         """
         self.img = img_batch.cuda()
         self.mask_grass = mask_grass_batch.cuda()
         self.mask_veg = mask_veg_batch.cuda()
         self.optimizer.zero_grad()
-        pred_grass, pred_veg = self.net.forward(self.img)
-
-        loss_dict = self.loss(pred_grass, self.mask_grass, pred_veg, self.mask_veg)
-
-        weighted_total = (grass_weight * loss_dict['grass'] +
-                          veg_weight * loss_dict['veg'])
-        weighted_total.backward()
-        self.optimizer.step()
+        with torch.amp.autocast('cuda', enabled=self.use_amp, dtype=self.amp_dtype):
+            pred_grass, pred_veg = self.net.forward(self.img)
+            loss_dict = self.loss(pred_grass, self.mask_grass, pred_veg, self.mask_veg)
+            weighted_total = (grass_weight * loss_dict['grass'] +
+                              veg_weight * loss_dict['veg'])
+        # AMP 路径：先 scale 再 backward，再 step（自动处理 inf/nan）
+        self.scaler.scale(weighted_total).backward()
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
         return loss_dict, pred_grass, pred_veg
 
     def optimize_dual_with_grad_monitor(self, img_batch, mask_grass_batch, mask_veg_batch, grass_weight=1.0, veg_weight=1.0):

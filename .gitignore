@@ -1,14 +1,65 @@
-# Keep parent directories, ignore all contents (runtime-generated artifacts)
-
-# Python cache (all locations)
+# Python
 __pycache__
 **/__pycache__
+*.pyc
 
 # D-linknet generated artifacts
-D-linknet/__pycache__/**
 D-linknet/logs/**
 D-linknet/predictions/**
 D-linknet/weights/**
 D-linknet/dataset/**
 
+# Temporary probe scripts (debugging artifacts, not for repo)
+D-linknet/ce.py
+D-linknet/ce2.py
+D-linknet/ce2_probe.py
 
+# Damage_Analysis test data & runtime artifacts
+Damage_Analysis/图论测试/**
+Damage_Analysis/full_roi_output.txt
+Damage_Analysis/real_test_output.txt
+Damage_Analysis/output/**
+
+# Sensitive / local notes
+Paper/**
+nature-skills/**
+academic-research-skills/**
+
+# MinerU PDF parsing outputs (reference paper extraction artifacts)
+D-linknet/docs/**/mineru_output/**
+
+# Reference papers (binaries; keep summaries only)
+D-linknet/docs/*.pdf
+
+# All MinerU / paper-extraction outputs (long UUID-suffixed dirs and images/)
+*/MinerU_markdown_*.md
+*/content_list*.json
+*content_list_v2.json
+*/block_list.json
+*/full.md
+*/images/*.jpg
+*/images/*.png
+
+# Nested git repos (skill packs) - keep as untracked; users can clone separately if needed
+Research-Paper-Writing-Skills/
+Skills对比分析-遥感视觉科研场景.md
+"Skills\345\257\271\346\257\224\345\210\206\346\236\220-\351\201\245\346\204\237\350\247\206\350\247\211\347\247\221\347\240\224\345\234\272\346\231\257.md"
+
+# Nested git repos (skill packs) - exclude from outer repo
+/学术资源/
+/academic-research-skills/
+/nature-skills/
+
+# UUID-suffixed MinerU extraction dirs (PDF parsing artifacts)
+*_content_list.json
+*_content_list_v2.json
+*_model.json
+layout.json
+
+# Project proposals / competition materials (large docs, keep local)
+/大创/**
+/挑战杯/**
+
+# Paper reading notes (markdown summaries extracted from PDFs)
+/D-linknet/docs/DSWFNet*/
+/D-linknet/docs/FERDNet*/

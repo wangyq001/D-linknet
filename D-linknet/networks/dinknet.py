@@ -171,40 +171,55 @@ class FrequencyBranch(nn.Module):
     频率分支（参考 DSWFNet 论文 Fig.1 右侧 Frequency Branch）。
 
     对原始输入图像做 Haar DWT 分解，
-    将 4 个子带（LL/LH/HL/HH）通过独立卷积映射到与 ResNet34 各阶段
+    将 4 个子带（LL/LH/HL/HH）通过线性 1x1 卷积映射到与 ResNet34 各阶段
     通道数匹配的表示空间。
+
+    设计要点（与前一版的区别）：
+    - 全部 1x1 投影都不带 BN、不带 ReLU，保留 LL/LH/HL/HH 子带的相对能量。
+    - 不再在内部用 SE/EFDCA，避免 sigmoid 把通道响应压到 1e-3 量级导致
+      后续梯度消失（实测上一版 f3 通道 std 已坍缩到 0.028，fc1 梯度 1e-13）。
+    - 输出通过 `f_out_norm` 暴露每层 f_k 的通道 std，便于训练时监控。
     """
     def __init__(self, spatial_channels=(64, 128, 256)):
         super().__init__()
         c1, c2, c3 = spatial_channels
 
-        self.map_f1 = nn.Sequential(
-            nn.Conv2d(12, c1, kernel_size=1, bias=False),
-            nn.BatchNorm2d(c1),
-            nn.ReLU(inplace=True),
-        )
-        self.efdca_f2 = nn.Sequential(
-            nn.Conv2d(c1, c2, kernel_size=1, bias=False),
-            nn.BatchNorm2d(c2),
-            EFDCA(c2),
-        )
-        self.efdca_f3 = nn.Sequential(
-            nn.Conv2d(c2, c3, kernel_size=1, bias=False),
-            nn.BatchNorm2d(c3),
-            EFDCA(c3),
-        )
+        self.proj_f1 = nn.Conv2d(12, c1, kernel_size=1, bias=True)
+        self.proj_f2 = nn.Conv2d(c1, c2, kernel_size=1, bias=True)
+        self.proj_f3 = nn.Conv2d(c2, c3, kernel_size=1, bias=True)
+
+        nn.init.kaiming_normal_(self.proj_f1.weight, a=0.0, mode='fan_in', nonlinearity='linear')
+        nn.init.zeros_(self.proj_f1.bias)
+        nn.init.kaiming_normal_(self.proj_f2.weight, a=0.0, mode='fan_in', nonlinearity='linear')
+        nn.init.zeros_(self.proj_f2.bias)
+        nn.init.kaiming_normal_(self.proj_f3.weight, a=0.0, mode='fan_in', nonlinearity='linear')
+        nn.init.zeros_(self.proj_f3.bias)
 
         self.haar = HaarWaveletTransform2D()
 
+        self.f_out_norm = None  # 训练时由 forward 写入 (c1, c2, c3) 三个通道 std，供监控
+
     def forward(self, x_input):
         LL, LH, HL, HH = self.haar(x_input)
+        freq_feat = torch.cat([LL, LH, HL, HH], dim=1)  # (B, 12, H/2, W/2)
 
-        freq_feat = torch.cat([LL, LH, HL, HH], dim=1)
+        f1 = self.proj_f1(freq_feat)
+        f2 = self.proj_f2(f1)
+        f3 = self.proj_f3(f2)
 
-        f1 = self.map_f1(freq_feat)
-
-        f2 = self.efdca_f2(f1)
-        f3 = self.efdca_f3(f2)
+        if not self.training:
+            with torch.no_grad():
+                self.f_out_norm = (
+                    f1.std(dim=(0, 2, 3)).mean().item(),
+                    f2.std(dim=(0, 2, 3)).mean().item(),
+                    f3.std(dim=(0, 2, 3)).mean().item(),
+                )
+        else:
+            self.f_out_norm = (
+                f1.std(dim=(0, 2, 3)).mean().item(),
+                f2.std(dim=(0, 2, 3)).mean().item(),
+                f3.std(dim=(0, 2, 3)).mean().item(),
+            )
 
         return f1, f2, f3
 
@@ -1076,9 +1091,9 @@ class DinkNet34_less_pool_DualHead_Freq(nn.Module):
         e3 = self.dblock(e3)
 
         d3_g = self.decoder3_grass(e3)
-        d3_fused_g = self.bcam3(d3_g, e2) + e2
+        d3_fused_g = self.bcam3(d3_g, f2_a) + e2
         d2_g = self.decoder2_grass(d3_fused_g)
-        d2_fused_g = self.bcam2(d2_g, e1) + e1
+        d2_fused_g = self.bcam2(d2_g, f1_a) + e1
         d1_g = self.decoder1_grass(d2_fused_g)
         out_g = self.finaldeconv1_grass(d1_g)
         out_g = self.finalrelu1_grass(out_g)
@@ -1088,9 +1103,9 @@ class DinkNet34_less_pool_DualHead_Freq(nn.Module):
         out_g = torch.sigmoid(out_g)
 
         d3_v = self.decoder3_veg(e3)
-        d3_fused_v = self.bcam3(d3_v, e2) + e2
+        d3_fused_v = self.bcam3(d3_v, f2_a) + e2
         d2_v = self.decoder2_veg(d3_fused_v)
-        d2_fused_v = self.bcam2(d2_v, e1) + e1
+        d2_fused_v = self.bcam2(d2_v, f1_a) + e1
         d1_v = self.decoder1_veg(d2_fused_v)
         out_v = self.finaldeconv1_veg(d1_v)
         out_v = self.finalrelu1_veg(out_v)

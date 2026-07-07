@@ -44,7 +44,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.join(SCRIPT_DIR, 'dataset', 'train')
 
 # --- 实验名称：用于生成日志文件和模型权重的命名标识
-NAME = 'dink34_033'
+NAME = 'dink34_046'
 
 # --- TensorBoard 日志根目录
 TENSORBOARD_LOG_DIR = '/root/autodl-tmp/tf-logs'
@@ -64,10 +64,10 @@ TOTAL_EPOCH = 300
 # TOTAL_EPOCH = 10
 
 # --- 早停策略：连续多少个 epoch 损失未下降则停止训练
-EARLY_STOP_THRESHOLD = 12
+EARLY_STOP_THRESHOLD = 20
 
 # --- 学习率衰减触发：连续多少个 epoch 损失未下降后开始衰减
-LR_DECAY_THRESHOLD = 6
+LR_DECAY_THRESHOLD = 10
 
 # --- 早停时学习率下界：学习率低于此值则彻底停止训练
 LR_MIN_BOUND = 3e-7
@@ -75,6 +75,14 @@ LR_MIN_BOUND = 3e-7
 # --- 学习率衰减因子（乘以旧学习率）；factor=True 时表示除以此值，=5.0 表示将学习率除以 5.0
 LR_DECAY_FACTOR = 3.0
 # LR_DECAY_FACTOR = 2.0
+
+# --- 混合精度训练（AMP）：True 时启用 torch.cuda.amp 加速并节省显存；CPU / 旧卡自动降级到 bf16
+USE_AMP = True
+
+# --- 是否在每次 LR 衰减时回退到 best model 权重
+#     True  -> 走传统"跳回 best 再小步探索"逻辑（容易和早停计数器耦合）
+#     False -> 原地继续训练，让 Adam 自然适应更小的 LR（推荐：与解耦后的 no_decay 计数器配合使用）
+LR_DECAY_RELOAD_BEST = False
 
 # --- DataLoader 的 CPU 多进程加载线程数
 NUM_WORKERS = 22
@@ -111,7 +119,7 @@ LOSS_CONFIG = {
         'Dice': 1.0,
         'BCE': 1.0,
         'Focal': 0.0,
-        'FocalBCE': 0.0,
+        'FocalBCE': 1.0,
         'Tversky': 0.0,
         'FocalTversky': 0.0,
         # cDice: 连通性加权，防止道路断裂
@@ -127,19 +135,19 @@ LOSS_CONFIG = {
         # FAL: 频域感知损失（参考 FreqU-FNet 论文，arXiv:2505.17544）
         #   - weight: FAL 总权重（0 表示不使用）
         #   - wavelet: 小波基，默认为 'db4'
-        'FAL': {'weight': 1, 'wavelet': 'db4'},
+        'FAL': {'weight': 0.0, 'wavelet': 'db4'},
     },
     'veg': {
         'Dice': 1.0,
         'BCE': 1.0,
         'Focal': 0.0,
-        'FocalBCE': 0.0,
+        'FocalBCE': 1.0,
         'Tversky': 0.0,
         'FocalTversky': 0.0,
         # 植被（团块）推荐：边界加权，改善边缘质量
         'cDice': {'weight': 0.0, 'mode': 'connectivity'},
         # FAL: 频域感知损失
-        'FAL': {'weight': 1, 'wavelet': 'db4'},
+        'FAL': {'weight': 0.0, 'wavelet': 'db4'},
     },
 }
 
@@ -401,7 +409,7 @@ if ENABLE_DUAL_HEAD:
         LOSS_CONFIG,
         loss_kwargs=loss_kwargs,
     )
-    solver = MyFrame(DUAL_HEAD_BASE_MODEL, loss_fn, INITIAL_LR)
+    solver = MyFrame(DUAL_HEAD_BASE_MODEL, loss_fn, INITIAL_LR, use_amp=USE_AMP)
     batchsize = torch.cuda.device_count() * max(1, BATCHSIZE_PER_CARD // 2)
     dataset = DualMaskTiffImageFolder(trainlist, ROOT)
     experiment_name = NAME + DUAL_HEAD_NAME_SUFFIX
@@ -414,7 +422,7 @@ if ENABLE_DUAL_HEAD:
           f"veg={LOSS_CONFIG['veg'].get('FAL', {}).get('weight', 0)}, "
           f"wavelet={LOSS_CONFIG['grass'].get('FAL', {}).get('wavelet', 'N/A')}")
 else:
-    solver = MyFrame(MODEL, dice_bce_loss, INITIAL_LR)
+    solver = MyFrame(MODEL, dice_bce_loss, INITIAL_LR, use_amp=USE_AMP)
     batchsize = torch.cuda.device_count() * BATCHSIZE_PER_CARD
     dataset = TiffImageFolder(trainlist, ROOT)
     experiment_name = NAME
@@ -437,6 +445,15 @@ tb_run_dir = os.path.join(TENSORBOARD_LOG_DIR, experiment_name + '_' + datetime.
 writer = SummaryWriter(tb_run_dir)
 print('[TensorBoard] logdir: %s' % tb_run_dir)
 print('[TensorBoard] Run: tensorboard --logdir=%s --port=6006' % TENSORBOARD_LOG_DIR)
+print('[AMP] use_amp=%s, dtype=%s, scaler_enabled=%s, LR_DECAY_RELOAD_BEST=%s' % (
+    USE_AMP,
+    solver.amp_dtype if USE_AMP else 'fp32',
+    solver.scaler.is_enabled() if USE_AMP else False,
+    LR_DECAY_RELOAD_BEST,
+))
+print('[Schedule] EARLY_STOP_THRESHOLD=%d, LR_DECAY_THRESHOLD=%d, LR_DECAY_FACTOR=%s, LR_MIN_BOUND=%s' % (
+    EARLY_STOP_THRESHOLD, LR_DECAY_THRESHOLD, LR_DECAY_FACTOR, LR_MIN_BOUND
+))
 
 csv_path = os.path.join(SCRIPT_DIR, 'logs', experiment_name + '_params.csv')
 csv_file = open(csv_path, 'w', newline='')
@@ -472,7 +489,8 @@ if PRETRAINED_WEIGHT_PATH:
     solver.load_pretrained(PRETRAINED_WEIGHT_PATH)
 
 tic = time()
-no_optim = 0
+no_optim = 0   # 早停计数器（连续多少个 epoch val 没有突破 best）
+no_decay = 0   # LR 衰减计数器（连续多少个 epoch val 没有突破 best）—— 与 no_optim 解耦
 train_epoch_best_loss = 100.
 val_epoch_best_loss = 100.
 val_epoch_best_miou = 0.  # 双头模式用草线+植被的 mIoU 作为最佳指标
@@ -537,11 +555,12 @@ for epoch in range(1, TOTAL_EPOCH + 1):
         val_step_count = 0
 
         with torch.no_grad():
-            for img, mask in val_data_loader_iter:
-                solver.set_input(img, mask)
-                solver.forward()
-                pred = solver.net.forward(solver.img)
-                total_loss, bce_loss_v, dice_loss_v = solver.loss(solver.mask, pred)
+            with torch.amp.autocast('cuda', enabled=solver.use_amp, dtype=solver.amp_dtype):
+                for img, mask in val_data_loader_iter:
+                    solver.set_input(img, mask)
+                    solver.forward()
+                    pred = solver.net.forward(solver.img)
+                    total_loss, bce_loss_v, dice_loss_v = solver.loss(solver.mask, pred)
 
                 val_epoch_loss += total_loss.data.item()
                 val_epoch_bce += bce_loss_v.data.item()
@@ -612,22 +631,33 @@ for epoch in range(1, TOTAL_EPOCH + 1):
 
         if val_epoch_loss >= val_epoch_best_loss:
             no_optim += 1
+            no_decay += 1
         else:
             no_optim = 0
+            no_decay = 0
             val_epoch_best_loss = val_epoch_loss
             solver.save(os.path.join(SCRIPT_DIR, 'weights', experiment_name + '.th'))
 
+        # ---- 早停（独立计数器，逻辑不再受 LR 衰减干扰） ----
         if no_optim > EARLY_STOP_THRESHOLD:
-            msg = 'early stop at epoch %d' % epoch
+            msg = 'early stop at epoch %d (no val_loss improvement for %d epochs)' % (epoch, EARLY_STOP_THRESHOLD)
             print(msg, file=mylog)
             print(msg)
             break
 
-        if no_optim > LR_DECAY_THRESHOLD:
+        # ---- LR 衰减（独立计数器；不再因 `load 回 best` 反复触发） ----
+        #     注：旧的"硬下界 break"被移除——LR 衰减后即便 old_lr 低于 LR_MIN_BOUND，
+        #     也只打日志、不退出；早停由 no_optim 单独负责。
+        if no_decay > LR_DECAY_THRESHOLD:
             if solver.old_lr < LR_MIN_BOUND:
-                break
-            solver.load(os.path.join(SCRIPT_DIR, 'weights', experiment_name + '.th'))
-            solver.update_lr(LR_DECAY_FACTOR, factor=True, mylog=mylog)
+                print('LR decay skipped: old_lr=%g < LR_MIN_BOUND=%g (will rely on early stop)' % (
+                    solver.old_lr, LR_MIN_BOUND), file=mylog)
+                print('LR decay skipped: old_lr=%g < LR_MIN_BOUND=%g (will rely on early stop)' % (
+                    solver.old_lr, LR_MIN_BOUND))
+            else:
+                if LR_DECAY_RELOAD_BEST:
+                    solver.load(os.path.join(SCRIPT_DIR, 'weights', experiment_name + '.th'))
+                solver.update_lr(LR_DECAY_FACTOR, factor=True, mylog=mylog)
 
     # ===== 双头模式训练 =====
     else:
@@ -750,11 +780,12 @@ for epoch in range(1, TOTAL_EPOCH + 1):
         val_step_count = 0
 
         with torch.no_grad():
-            for img, mask_g, mask_v in val_data_loader_iter:
-                solver.set_input_dual(img, mask_g, mask_v)
-                solver.forward()
-                pred_g, pred_v = solver.net.forward(solver.img)
-                loss_dict = solver.loss(pred_g, mask_g.cuda(), pred_v, mask_v.cuda())
+            with torch.amp.autocast('cuda', enabled=solver.use_amp, dtype=solver.amp_dtype):
+                for img, mask_g, mask_v in val_data_loader_iter:
+                    solver.set_input_dual(img, mask_g, mask_v)
+                    solver.forward()
+                    pred_g, pred_v = solver.net.forward(solver.img)
+                    loss_dict = solver.loss(pred_g, mask_g.cuda(), pred_v, mask_v.cuda())
 
                 val_loss_total += loss_dict['total'].item()
                 val_loss_grass += loss_dict['grass'].item()
@@ -923,8 +954,10 @@ for epoch in range(1, TOTAL_EPOCH + 1):
 
         if val_miou <= val_epoch_best_miou:
             no_optim += 1
+            no_decay += 1
         else:
             no_optim = 0
+            no_decay = 0
             val_epoch_best_miou = val_miou
             solver.save(os.path.join(SCRIPT_DIR, 'weights', experiment_name + '.th'))
             writer.add_scalar('Loss/val_best_miou', val_epoch_best_miou, epoch)
@@ -933,6 +966,7 @@ for epoch in range(1, TOTAL_EPOCH + 1):
             print('[DualHead] Epoch {}: new best mIoU={:.4f} (grass={:.4f}, veg={:.4f})'.format(
                 epoch, val_miou, val_grass_iou, val_veg_iou))
 
+        # ---- 早停（独立计数器） ----
         if no_optim > EARLY_STOP_THRESHOLD:
             msg = '[DualHead] early stop at epoch %d (no mIoU improvement for %d epochs)' % (
                 epoch, EARLY_STOP_THRESHOLD)
@@ -940,20 +974,28 @@ for epoch in range(1, TOTAL_EPOCH + 1):
             print(msg)
             break
 
-        if no_optim > LR_DECAY_THRESHOLD:
+        # ---- LR 衰减（独立计数器；不再因 `load 回 best` 反复触发） ----
+        #     注：旧的"LR_MIN_BOUND break"被移除——LR 衰减后即便 old_lr 低于 LR_MIN_BOUND，
+        #     也只打日志、不退出；早停由 no_optim 单独负责。
+        if no_decay > LR_DECAY_THRESHOLD:
             if solver.old_lr < LR_MIN_BOUND:
-                break
-            # 植被全量加入后有稳定期保护，不立即衰减学习率
-            veg_grace_epochs = 5
-            epochs_since_veg_full = epoch - WARMUP_EPOCHS - RAMP_EPOCHS
-            if epochs_since_veg_full < veg_grace_epochs:
-                print('[DualHead] Epoch %d: LR decay skipped (veg grace period, %d/%d), mIoU=%.4f' % (
-                    epoch, epochs_since_veg_full + 1, veg_grace_epochs, val_miou), file=mylog)
-                print('[DualHead] Epoch %d: LR decay skipped (veg grace period, %d/%d), mIoU=%.4f' % (
-                    epoch, epochs_since_veg_full + 1, veg_grace_epochs, val_miou))
+                print('[DualHead] Epoch %d: LR decay skipped (old_lr=%g < LR_MIN_BOUND=%g, '
+                      'will rely on early stop)' % (epoch, solver.old_lr, LR_MIN_BOUND), file=mylog)
+                print('[DualHead] Epoch %d: LR decay skipped (old_lr=%g < LR_MIN_BOUND=%g, '
+                      'will rely on early stop)' % (epoch, solver.old_lr, LR_MIN_BOUND))
             else:
-                solver.load(os.path.join(SCRIPT_DIR, 'weights', experiment_name + '.th'))
-                solver.update_lr(LR_DECAY_FACTOR, factor=True, mylog=mylog)
+                # 植被全量加入后有稳定期保护，不立即衰减学习率
+                veg_grace_epochs = 5
+                epochs_since_veg_full = epoch - WARMUP_EPOCHS - RAMP_EPOCHS
+                if epochs_since_veg_full < veg_grace_epochs:
+                    print('[DualHead] Epoch %d: LR decay skipped (veg grace period, %d/%d), mIoU=%.4f' % (
+                        epoch, epochs_since_veg_full + 1, veg_grace_epochs, val_miou), file=mylog)
+                    print('[DualHead] Epoch %d: LR decay skipped (veg grace period, %d/%d), mIoU=%.4f' % (
+                        epoch, epochs_since_veg_full + 1, veg_grace_epochs, val_miou))
+                else:
+                    if LR_DECAY_RELOAD_BEST:
+                        solver.load(os.path.join(SCRIPT_DIR, 'weights', experiment_name + '.th'))
+                    solver.update_lr(LR_DECAY_FACTOR, factor=True, mylog=mylog)
 
 print('Finish!', file=mylog)
 print('Finish!')

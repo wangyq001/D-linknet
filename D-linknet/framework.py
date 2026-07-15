@@ -6,17 +6,23 @@ import numpy as np
 
 
 class MyFrame():
-    def __init__(self, net, loss, lr=2e-4, evalmode=False, use_amp=True, amp_dtype=torch.float16):
+    def __init__(self, net, loss, lr=2e-4, evalmode=False, use_amp=True, amp_dtype=torch.float16, model_kwargs=None):
         """
         Args:
-            net:        模型类（class），实例化时调用 net()
+            net:        模型类（class），实例化时调用 net(**model_kwargs)
+                        或直接传入已实例化的模型对象（兼容旧用法）
             loss:       损失函数类（class），实例化时调用 loss()
             lr:         初始学习率
             evalmode:   True 时把所有 BatchNorm 固定在 eval 模式
             use_amp:    True 时使用 torch.cuda.amp 自动混合精度训练（默认 True）
             amp_dtype:  autocast 用的低精度 dtype，默认 fp16；CPU/GPU 不支持 fp16 时退化为 bf16
+            model_kwargs: 可选 dict，透传给 net() 实例化时的关键字参数
         """
-        self.net = net().cuda()
+        if isinstance(net, type):
+            actual_kwargs = model_kwargs if model_kwargs is not None else {}
+            self.net = net(**actual_kwargs).cuda()
+        else:
+            self.net = net.cuda()
         self.net = torch.nn.DataParallel(self.net, device_ids=range(torch.cuda.device_count()))
         self.optimizer = torch.optim.Adam(params=self.net.parameters(), lr=lr)
         #self.optimizer = torch.optim.RMSprop(params=self.net.parameters(), lr=lr)
@@ -90,7 +96,7 @@ class MyFrame():
         # autocast 包住前向；损失计算放进 autocast 区，以保持 logits 与 loss 的 dtype 一致
         with torch.amp.autocast('cuda', enabled=self.use_amp, dtype=self.amp_dtype):
             pred = self.net.forward(self.img)
-            total_loss, bce_loss, dice_loss = self.loss(self.mask, pred)
+            total_loss, bce_loss, dice_loss = self.loss(self.mask, torch.sigmoid(pred))
         # scaler.scale 之后 backward；scaler.step 调用 optimizer.step（自动 unscale + 跳过 inf/nan）
         self.scaler.scale(total_loss).backward()
         self.scaler.step(self.optimizer)
@@ -206,6 +212,114 @@ class MyFrame():
         else:
             print(f'[DualHead] Vegetation branch unfrozen ({unfrozen_count} params)')
 
+    def set_grass_params_frozen(self, frozen=True):
+        """
+        冻结/解冻草线分支（decoder_grass）的参数。
+        与 set_veg_params_frozen 对称，用于双 head 独立早停后的草线头冻结。
+        frozen=True  -> 草线分支不更新（草线头早停后调用）
+        frozen=False -> 草线分支正常更新
+        """
+        grass_param_names = {
+            'decoder4_grass', 'decoder3_grass', 'decoder2_grass', 'decoder1_grass',
+            'finaldeconv1_grass', 'finalconv2_grass', 'finalconv3_grass',
+        }
+
+        frozen_count = 0
+        unfrozen_count = 0
+        for name, param in self.net.named_parameters():
+            is_grass = any(gn in name for gn in grass_param_names)
+            if is_grass:
+                if frozen:
+                    if param.requires_grad:
+                        param.requires_grad = False
+                        frozen_count += 1
+                else:
+                    if not param.requires_grad:
+                        param.requires_grad = True
+                        unfrozen_count += 1
+
+        if frozen:
+            print(f'[DualHead] Grass branch frozen ({frozen_count} params)')
+        else:
+            print(f'[DualHead] Grass branch unfrozen ({unfrozen_count} params)')
+
+    def setup_dual_head_param_groups(self):
+        """
+        为双头模型构建按 head 分组的 param groups，用于独立 LR 衰减。
+        分组：
+          group 0: encoder 共享部分（firstconv, firstbn, encoder1~3, dblock, freq_branch）
+          group 1: 草线头（decoder*_grass + final*_grass）
+          group 2: 植被头（decoder*_veg + final*_veg）
+          group 3: 共享融合模块（bcam*, dcfe*）
+
+        返回：(param_group_indices_dict)
+        """
+        encoder_names = {'firstconv', 'firstbn', 'firstrelu', 'firstmaxpool',
+                         'encoder1', 'encoder2', 'encoder3', 'dblock', 'freq_branch'}
+        grass_names = {'decoder1_grass', 'decoder2_grass', 'decoder3_grass', 'decoder4_grass',
+                       'finaldeconv1_grass', 'finalconv2_grass', 'finalconv3_grass'}
+        veg_names = {'decoder1_veg', 'decoder2_veg', 'decoder3_veg', 'decoder4_veg',
+                     'finaldeconv1_veg', 'finalconv2_veg', 'finalconv3_veg'}
+        shared_names = {'bcam', 'dcfe', 'dcca'}
+
+        encoder_params, grass_params, veg_params, shared_params = [], [], [], []
+        for name, param in self.net.named_parameters():
+            short = name.split('.')[-1]
+            if any(short.startswith(p) or p in name for p in grass_names):
+                grass_params.append(param)
+            elif any(short.startswith(p) or p in name for p in veg_names):
+                veg_params.append(param)
+            elif any(s in name for s in shared_names):
+                shared_params.append(param)
+            else:
+                encoder_params.append(param)
+
+        print(f'[DualHead] Param groups: encoder={len(encoder_params)}, grass={len(grass_params)}, '
+              f'veg={len(veg_params)}, shared={len(shared_params)}')
+
+        initial_lr = self.old_lr
+        self.optimizer = torch.optim.Adam([
+            {'params': encoder_params, 'lr': initial_lr},
+            {'params': grass_params,   'lr': initial_lr},
+            {'params': veg_params,     'lr': initial_lr},
+            {'params': shared_params,  'lr': initial_lr},
+        ])
+
+        self.param_group_indices = {
+            'encoder': 0,
+            'grass':   1,
+            'veg':     2,
+            'shared':  3,
+        }
+        return self.param_group_indices
+
+    def update_lr_group(self, group_name, factor, mylog=None):
+        """
+        按 param group 名称缩放学习率。
+        group_name ∈ {'encoder', 'grass', 'veg', 'shared'}。
+        factor > 1 表示除以 factor，factor < 1 表示乘以 factor（即 new_lr = old_lr / factor）。
+
+        注意：DCCA/DCFE（shared）和 freq_branch 与 encoder 在 train.py 中按业务约定跟随 grass，
+        因此本方法只负责按 group_name 单独缩放；如需联动，由调用方多次调用。
+        """
+        idx = self.param_group_indices.get(group_name)
+        if idx is None:
+            raise ValueError(f'Unknown group_name: {group_name}; valid: {list(self.param_group_indices.keys())}')
+        old_lr = self.optimizer.param_groups[idx]['lr']
+        new_lr = old_lr / factor
+        self.optimizer.param_groups[idx]['lr'] = new_lr
+
+        if mylog is not None:
+            print(f'[LR] {group_name} group: {old_lr:.6e} -> {new_lr:.6e} (factor={factor})', file=mylog)
+        print(f'[LR] {group_name} group: {old_lr:.6e} -> {new_lr:.6e} (factor={factor})')
+
+    def get_lr_by_group(self, group_name):
+        """查询指定 group 的当前学习率。"""
+        idx = self.param_group_indices.get(group_name)
+        if idx is None:
+            return None
+        return self.optimizer.param_groups[idx]['lr']
+
     def optimize_dual(self, img_batch, mask_grass_batch, mask_veg_batch, grass_weight=1.0, veg_weight=1.0):
         """
         双头训练一步。
@@ -226,7 +340,10 @@ class MyFrame():
         self.optimizer.zero_grad()
         with torch.amp.autocast('cuda', enabled=self.use_amp, dtype=self.amp_dtype):
             pred_grass, pred_veg = self.net.forward(self.img)
-            loss_dict = self.loss(pred_grass, self.mask_grass, pred_veg, self.mask_veg)
+            loss_dict = self.loss(
+                torch.sigmoid(pred_grass), self.mask_grass,
+                torch.sigmoid(pred_veg), self.mask_veg,
+            )
             weighted_total = (grass_weight * loss_dict['grass'] +
                               veg_weight * loss_dict['veg'])
         # AMP 路径：先 scale 再 backward，再 step（自动处理 inf/nan）

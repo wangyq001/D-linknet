@@ -1,45 +1,9 @@
-# ============================================================
-# 依赖包需求文档
-# ============================================================
-#
-# 【方案一】原始环境（与原 README 一致，Python 2.7）
-# 这是原作者使用的环境配置：
-#
-#   Python == 2.7
-#   CUDA == 8.0
-#   PyTorch == 0.2.0
-#   torchvision == 0.1.8   (与 PyTorch 0.2.0 配套)
-#   opencv-python == 3.4.5.20
-#   numpy == 1.14.6
-#
-# 安装命令：
-#   pip install torch==0.2.0 torchvision==0.1.8
-#   pip install opencv-python==3.4.5.20
-#   pip install numpy==1.14.6
-#
-# 注意：此方案在 Python 3 环境下无法直接使用，且老版本 PyTorch
-# 在现代 GPU（RTX 30/40 系列、RTX 5000 等）上可能存在兼容性问题。
-#
-#
-# 【方案二】现代环境（推荐，Python 3）
-# 适用于 2024-2026 年的硬件和软件栈：
-#
+# D-LinkNet 项目依赖
+
 torch>=1.10.0
 torchvision>=0.11.0
 opencv-python>=4.5.0
 numpy>=1.21.0
 matplotlib>=3.5.0
 pillow>=9.0.0
-
-# 兼容 Python 2/3 的代码需要少量修改（详见学习指南）
-#
-#
-# 【方案三】精确锁定版本（平衡稳定与兼容）
-#
-torch==1.13.1
-torchvision==0.14.1
-opencv-python==4.7.0.72
-numpy==1.24.3
-matplotlib==3.7.1
-pillow==9.5.0
-
+tensorboard>=2.10.0

@@ -1,7 +1,0 @@
-NAME,DUAL_HEAD_BASE_MODEL,GRASS_DICE,GRASS_BCE,GRASS_CDICE,GRASS_CDICE_MODE,GRASS_FOCAL,GRASS_FOCALBCE,GRASS_TVERSKY,GRASS_FOCAL_TVERSKY,VEG_DICE,VEG_BCE,VEG_CDICE,VEG_CDICE_MODE,VEG_FOCAL,VEG_FOCALBCE,VEG_TVERSKY,VEG_FOCAL_TVERSKY
-dink34_009,DinkNet34_less_pool_DualHead,1.0,1.0,0.0,,0.0,0.0,0.0,0.0,1.0,1.0,0.0,,0.0,0.0,0.0,0.0
-dink34_010,DinkNet34_less_pool_DualHead,1.0,1.0,1.0,boundary,0.0,0.0,0.0,0.0,1.0,0.0,1.0,connectivity,0.0,0.0,0.0,0.0
-dink34_011,DinkNet34_less_pool_DualHead,1.0,1.0,0.0,,1.0,0.0,0.0,0.0,1.0,0.0,0.0,,1.0,0.0,0.0,0.0
-dink34_012,DinkNet34_less_pool_DualHead,1.0,1.0,0.0,,0.0,0.0,1.0,0.0,1.0,0.0,0.0,,0.0,0.0,1.0,0.0
-dink34_013,DinkNet34_less_pool_DualHead,1.0,1.0,0.0,,0.0,1.0,0.0,0.0,1.0,0.0,0.0,,0.0,1.0,0.0,0.0
-dink34_014,DinkNet34_less_pool_DualHead,1.0,1.0,0.0,,0.0,0.0,0.0,1.0,1.0,0.0,0.0,,0.0,0.0,0.0,1.0

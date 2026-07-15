@@ -5,6 +5,7 @@ import torchvision.utils as vutils
 
 import cv2
 import os
+import math
 import numpy as np
 import csv
 
@@ -31,11 +32,13 @@ from data import ImageFolder, DualMaskTiffImageFolder
 # ============================================================
 
 # --- 模型选择：可选 Unet / Dunet / DinkNet34 / DinkNet50 / DinkNet101 / LinkNet34 / DinkNet34_less_pool
-MODEL = LinkNet34
+MODEL = DinkNet34_less_pool
 
 # --- 预训练权重路径（设置为 None 则不使用预训练）
 # PRETRAINED_WEIGHT_PATH = '/root/autodl-tmp/DLinknet/D-linknet/weights/log01_dink34.th'
 PRETRAINED_WEIGHT_PATH = None
+# PRETRAINED_WEIGHT_PATH = '/root/autodl-tmp/DLinknet/D-linknet/weights/dink34_057_FD_best_grass.th'
+
 
 # --- 数据集根目录（dataset/ 下应包含 images/ 和 labels/ 两个子目录）
 #     images/: 遥感图像 (*.tif)
@@ -44,7 +47,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.join(SCRIPT_DIR, 'dataset', 'train')
 
 # --- 实验名称：用于生成日志文件和模型权重的命名标识
-NAME = 'dink34_046'
+NAME = 'dink34_063'
 
 # --- TensorBoard 日志根目录
 TENSORBOARD_LOG_DIR = '/root/autodl-tmp/tf-logs'
@@ -53,28 +56,52 @@ TENSORBOARD_LOG_DIR = '/root/autodl-tmp/tf-logs'
 SHAPE = (1024, 1024)
 
 # --- 每次梯度更新所使用的样本数量（每个 GPU）
-BATCHSIZE_PER_CARD = 12
+BATCHSIZE_PER_CARD = 22
 
 # --- 初始学习率
-INITIAL_LR = 2e-4
-# INITIAL_LR = 3e-4
+# INITIAL_LR = 2e-5
+INITIAL_LR = 3e-4
 
 # --- 最大训练轮数
-TOTAL_EPOCH = 300
-# TOTAL_EPOCH = 10
+TOTAL_EPOCH = 360
+# TOTAL_EPOCH = 60
 
 # --- 早停策略：连续多少个 epoch 损失未下降则停止训练
-EARLY_STOP_THRESHOLD = 20
+EARLY_STOP_THRESHOLD = 10
 
 # --- 学习率衰减触发：连续多少个 epoch 损失未下降后开始衰减
-LR_DECAY_THRESHOLD = 10
+LR_DECAY_THRESHOLD = 5
 
 # --- 早停时学习率下界：学习率低于此值则彻底停止训练
-LR_MIN_BOUND = 3e-7
+LR_MIN_BOUND = 2e-7
 
 # --- 学习率衰减因子（乘以旧学习率）；factor=True 时表示除以此值，=5.0 表示将学习率除以 5.0
-LR_DECAY_FACTOR = 3.0
+# LR_DECAY_FACTOR = 3.0
 # LR_DECAY_FACTOR = 2.0
+LR_DECAY_FACTOR = 1.5
+
+# ================================================================
+# 【余弦退火学习率调度（Cosine Annealing LR Schedule）】
+# 与上面的 Reduce-on-Plateau（LR_DECAY_THRESHOLD）机制并存：
+#   USE_COSINE_ANNEALING = True  → 启用余弦退火（忽略 LR_DECAY_THRESHOLD 计数）
+#   USE_COSINE_ANNEALING = False → 退回原 Reduce-on-Plateau 机制
+#
+# 衰减信号：余弦退火以"训练 epoch 进度"作为信号（与 val_iou 震荡完全解耦），
+#           不再依赖 IoU 是否停滞。这意味着无论 val_iou 怎么波动，
+#           学习率都会按预设曲线下降，从根本上解决你这次训练
+#           "300 epoch LR 始终不衰减"的问题。
+#
+# 任务级独立：双头模式下，encoder / grass / shared 共享"草线"的余弦进度，
+#             veg 头独享"植被"余弦进度，支持草线 / 植被各自独立衰减。
+# ================================================================
+USE_COSINE_ANNEALING = False         # 余弦退火的 lr_max 直接借用 INITIAL_LR
+COSINE_T_MAX = 320                 # 余弦退火半周期长度；单头=WARMUP 之后到训练结束的 epoch 数
+                                  # 200 之后策略 B 要求 LR 进入谷底（接近 ETA_MIN）才允许早停
+COSINE_ETA_MIN = 2e-7             # 学习率下界；与 LR_MIN_BOUND = 3e-7 配合（保证衔接早停）
+COSINE_WARMUP_EPOCHS = 5          # 前 N 轮线性 warmup（从 0 → INITIAL_LR）
+COSINE_USE_INDEPENDENT_TASK_LR = True   # 双头模式：草线 / 植被是否使用独立余弦曲线
+                                        # True  → 草线和植被各自走自己的余弦进度（推荐）
+                                        # False → 草线和植被共用同一条余弦曲线（耦合）
 
 # --- 混合精度训练（AMP）：True 时启用 torch.cuda.amp 加速并节省显存；CPU / 旧卡自动降级到 bf16
 USE_AMP = True
@@ -104,6 +131,14 @@ ENABLE_DUAL_HEAD = True
 # DUAL_HEAD_BASE_MODEL = DinkNet34_less_pool_DualHead
 DUAL_HEAD_BASE_MODEL = DinkNet34_less_pool_DualHead_Freq
 
+# ================================================================
+# 【模块级消融开关（方案 B：DCCA + DCFE）】
+# USE_DCCA = True  → BCAMFusion 内部使用 DCCA（方案 B 重命名，语义等价于 BCAM）
+# USE_DCFE = True  → 在最深 BCAM3 输出后插入 DCFE（MFE 方案 B 版本）
+# ================================================================
+USE_DCCA = False
+USE_DCFE = True       # 消融实验：True=启用 DCFE，False=禁用（对照组）
+
 # --- 损失函数配置（传递给 ConfigurableDualTaskLoss）
 # 设置 weight=0 表示不使用该损失
 #
@@ -117,7 +152,7 @@ DUAL_HEAD_BASE_MODEL = DinkNet34_less_pool_DualHead_Freq
 LOSS_CONFIG = {
     'grass': {
         'Dice': 1.0,
-        'BCE': 1.0,
+        'BCE': 0.0,
         'Focal': 0.0,
         'FocalBCE': 1.0,
         'Tversky': 0.0,
@@ -139,7 +174,7 @@ LOSS_CONFIG = {
     },
     'veg': {
         'Dice': 1.0,
-        'BCE': 1.0,
+        'BCE': 0.0,
         'Focal': 0.0,
         'FocalBCE': 1.0,
         'Tversky': 0.0,
@@ -161,19 +196,66 @@ TVERSKY_GAMMA = 0.7
 #     RAMP_EPOCHS:   植被权重从 0 线性增长到最大值的轮数，实现辅助任务的渐进引入
 #     VEG_LOSS_WEIGHT_MAX: 植被分支损失的最大相对权重（相对于草线的 1.0），建议范围 0.2~0.6
 WARMUP_EPOCHS = 20
-RAMP_EPOCHS   = 20
-VEG_LOSS_WEIGHT_MAX = 0.5
-
+RAMP_EPOCHS   = 30            # 拉长 ramp，平滑植被权重增长
 # WARMUP_EPOCHS = 3
-# RAMP_EPOCHS   = 3
-# VEG_LOSS_WEIGHT_MAX = 0.6
+# RAMP_EPOCHS   = 5
+VEG_LOSS_WEIGHT_MAX = 0.3     # 训练时=0.5 会压制草线，回到 0.3 平衡
+
 
 # --- 双头模式下的实验名称后缀
-DUAL_HEAD_NAME_SUFFIX = '_dual_Freq'
+DUAL_HEAD_NAME_SUFFIX = '_FD'
 
 # ================================================================
 # 【以下代码通常无需修改】
 # ================================================================
+
+
+# ================================================================
+# 余弦退火 LR 计算函数（支持 warmup）
+#   - signal = epoch 进度，而非 IoU 进度
+#   - 所以无论 val_iou 怎么震荡，LR 都按曲线下降
+# ================================================================
+def cosine_lr_at_epoch(epoch, warmup_epochs, total_epochs, lr_max, lr_min):
+    """
+    带线性 warmup 的余弦退火学习率。
+    入参 total_epochs 语义为"T_MAX"：余弦曲线长度。
+
+    公式:
+        epoch < warmup_epochs:
+            lr = lr_max * (epoch + 1) / warmup_epochs
+        epoch >= total_epochs:
+            lr = lr_min（曲线已跑完，停在谷底）
+        否则:
+            progress = (epoch - warmup_epochs) / (total_epochs - warmup_epochs)
+            lr = lr_min + 0.5 * (lr_max - lr_min) * (1 + cos(π · progress))
+    """
+    if warmup_epochs > 0 and epoch < warmup_epochs:
+        return lr_max * (epoch + 1) / warmup_epochs
+    # 过期：epoch 走过余弦曲线全程后，保持在 lr_min
+    if epoch >= total_epochs:
+        return lr_min
+    progress = (epoch - max(warmup_epochs, 0)) / max(total_epochs - max(warmup_epochs, 0), 1)
+    progress = min(max(progress, 0.0), 1.0)
+    return lr_min + 0.5 * (lr_max - lr_min) * (1.0 + math.cos(math.pi * progress))
+
+
+def apply_cosine_lr_to_optimizer(optimizer, epoch,
+                                 warmup_epochs, total_epochs, lr_max, lr_min,
+                                 only_indices=None):
+    """
+    把余弦退火计算出的 LR 应用到 optimizer.param_groups。
+    only_indices=None -> 应用到所有 group；否则只对指定下标的 group 生效。
+    返回: dict{index: new_lr}
+    """
+    lr_now = cosine_lr_at_epoch(epoch, warmup_epochs, total_epochs, lr_max, lr_min)
+    out = {}
+    n_groups = len(optimizer.param_groups)
+    indices = only_indices if only_indices is not None else range(n_groups)
+    for idx in indices:
+        if 0 <= idx < n_groups:
+            optimizer.param_groups[idx]['lr'] = lr_now
+            out[idx] = lr_now
+    return out
 
 
 def compute_segmentation_metrics(pred, target, threshold=0.5):
@@ -409,11 +491,18 @@ if ENABLE_DUAL_HEAD:
         LOSS_CONFIG,
         loss_kwargs=loss_kwargs,
     )
-    solver = MyFrame(DUAL_HEAD_BASE_MODEL, loss_fn, INITIAL_LR, use_amp=USE_AMP)
+    model_kwargs = {}
+    if 'use_dcfe' in DUAL_HEAD_BASE_MODEL.__init__.__code__.co_varnames:
+        model_kwargs['use_dcfe'] = USE_DCFE
+    if 'use_dcca' in DUAL_HEAD_BASE_MODEL.__init__.__code__.co_varnames:
+        model_kwargs['use_dcca'] = USE_DCCA
+    solver = MyFrame(DUAL_HEAD_BASE_MODEL, loss_fn, INITIAL_LR, use_amp=USE_AMP, model_kwargs=model_kwargs)
+    solver.setup_dual_head_param_groups()
     batchsize = torch.cuda.device_count() * max(1, BATCHSIZE_PER_CARD // 2)
     dataset = DualMaskTiffImageFolder(trainlist, ROOT)
     experiment_name = NAME + DUAL_HEAD_NAME_SUFFIX
     print(f'[DualHead] Enabled. Base model: {DUAL_HEAD_BASE_MODEL.__name__}')
+    print(f'[DCCA+DCFE] use_dcfe={USE_DCFE}')
     print(f'[DualHead] Loss config: grass={LOSS_CONFIG["grass"]}')
     print(f'[DualHead] Loss config: veg={LOSS_CONFIG["veg"]}')
     print(f'[DualHead] WARMUP={WARMUP_EPOCHS} epochs, RAMP={RAMP_EPOCHS} epochs, '
@@ -454,6 +543,10 @@ print('[AMP] use_amp=%s, dtype=%s, scaler_enabled=%s, LR_DECAY_RELOAD_BEST=%s' %
 print('[Schedule] EARLY_STOP_THRESHOLD=%d, LR_DECAY_THRESHOLD=%d, LR_DECAY_FACTOR=%s, LR_MIN_BOUND=%s' % (
     EARLY_STOP_THRESHOLD, LR_DECAY_THRESHOLD, LR_DECAY_FACTOR, LR_MIN_BOUND
 ))
+print('[Schedule] USE_COSINE_ANNEALING=%s, T_MAX=%d, ETA_MIN=%g, WARMUP=%d, INDEPENDENT_TASK_LR=%s' % (
+    USE_COSINE_ANNEALING, COSINE_T_MAX, COSINE_ETA_MIN, COSINE_WARMUP_EPOCHS,
+    COSINE_USE_INDEPENDENT_TASK_LR
+))
 
 csv_path = os.path.join(SCRIPT_DIR, 'logs', experiment_name + '_params.csv')
 csv_file = open(csv_path, 'w', newline='')
@@ -474,6 +567,11 @@ if ENABLE_DUAL_HEAD:
         'val_grass_acc', 'val_grass_recall', 'val_grass_iou', 'val_grass_f1',
         'val_veg_acc', 'val_veg_recall', 'val_veg_iou', 'val_veg_f1',
         'val_miou', 'no_optim',
+        # ---- 双 head 独立监控 ----
+        'best_grass_iou', 'best_veg_iou', 'grass_no_improve', 'veg_no_improve',
+        'grass_frozen', 'veg_frozen', 'loss_ratio',
+        # ---- 余弦退火逐 epoch LR（方便审计 LR 曲线）----
+        'lr_encoder', 'lr_grass', 'lr_veg', 'lr_shared', 'scheduler_name',
     ])
 else:
     csv_writer.writerow([
@@ -489,23 +587,50 @@ if PRETRAINED_WEIGHT_PATH:
     solver.load_pretrained(PRETRAINED_WEIGHT_PATH)
 
 tic = time()
+# ===== 单头模式：单一计数器（保持原行为） =====
 no_optim = 0   # 早停计数器（连续多少个 epoch val 没有突破 best）
 no_decay = 0   # LR 衰减计数器（连续多少个 epoch val 没有突破 best）—— 与 no_optim 解耦
 train_epoch_best_loss = 100.
 val_epoch_best_loss = 100.
 val_epoch_best_miou = 0.  # 双头模式用草线+植被的 mIoU 作为最佳指标
 
+# ===== 双头模式：双 head 独立计数器 + 冻结标志 =====
+#   grass_no_improve_count / best_grass_iou: 草线头独立 LR 衰减 / 早停信号
+#   veg_no_improve_count   / best_veg_iou:   植被头独立 LR 衰减 / 早停信号
+#   grass_frozen / veg_frozen: 头被独立早停后置 True，不再计数；梯度由 set_*_frozen 切断
+#   ramp 阶段（WARMUP + RAMP）内不计入 no_improve，避免 ramp 期间错误触发
+best_grass_iou = 0.0
+best_veg_iou   = 0.0
+grass_no_improve_count = 0
+veg_no_improve_count   = 0
+grass_frozen = False
+veg_frozen   = False
+val_epoch_best_miou_overall = 0.0  # 双头模式额外保存 "整体 mIoU 最佳" 权重
+
 for epoch in range(1, TOTAL_EPOCH + 1):
     data_loader_iter = iter(data_loader)
 
-    # ===== 植被分支权重计算（两阶段 ramp-up） =====
+    # ===== 植被分支权重计算（两阶段 ramp-up + 早停后强制清零） =====
     if ENABLE_DUAL_HEAD:
         if epoch <= WARMUP_EPOCHS:
-            veg_weight = 0.0
+            eff_veg_weight = 0.0
         else:
             ramp_progress = min(1.0, (epoch - WARMUP_EPOCHS) / RAMP_EPOCHS)
-            veg_weight = VEG_LOSS_WEIGHT_MAX * ramp_progress
+            eff_veg_weight = VEG_LOSS_WEIGHT_MAX * ramp_progress
+        # veg 头早停后强制置 0（虽然梯度已被 set_veg_params_frozen 切断，loss 计算仍输出供监控）
+        if veg_frozen:
+            eff_veg_weight = 0.0
+        veg_weight = eff_veg_weight
         grass_weight = 1.0
+
+        # ---- DEBUG：打印实际生效的 veg_weight ----
+        if ENABLE_DUAL_HEAD:
+            dbg_msg = ('[DEBUG eff_veg_weight={:.4f}] '
+                       'MAX={}, WARMUP={}, RAMP={}, veg_frozen={}, grass_frozen={}').format(
+                eff_veg_weight, VEG_LOSS_WEIGHT_MAX, WARMUP_EPOCHS, RAMP_EPOCHS,
+                veg_frozen, grass_frozen)
+            print(dbg_msg, file=mylog)
+            print(dbg_msg)
 
     # ===== 单头模式训练 =====
     if not ENABLE_DUAL_HEAD:
@@ -645,19 +770,42 @@ for epoch in range(1, TOTAL_EPOCH + 1):
             print(msg)
             break
 
-        # ---- LR 衰减（独立计数器；不再因 `load 回 best` 反复触发） ----
-        #     注：旧的"硬下界 break"被移除——LR 衰减后即便 old_lr 低于 LR_MIN_BOUND，
-        #     也只打日志、不退出；早停由 no_optim 单独负责。
-        if no_decay > LR_DECAY_THRESHOLD:
-            if solver.old_lr < LR_MIN_BOUND:
-                print('LR decay skipped: old_lr=%g < LR_MIN_BOUND=%g (will rely on early stop)' % (
-                    solver.old_lr, LR_MIN_BOUND), file=mylog)
-                print('LR decay skipped: old_lr=%g < LR_MIN_BOUND=%g (will rely on early stop)' % (
-                    solver.old_lr, LR_MIN_BOUND))
-            else:
-                if LR_DECAY_RELOAD_BEST:
-                    solver.load(os.path.join(SCRIPT_DIR, 'weights', experiment_name + '.th'))
-                solver.update_lr(LR_DECAY_FACTOR, factor=True, mylog=mylog)
+        # ---- LR 调度（余弦退火 / Reduce-on-Plateau 二选一）----
+        if USE_COSINE_ANNEALING:
+            # 余弦退火路径：以 epoch 进度为信号，与 val_iou 震荡完全解耦
+            # 049 修正：total_epochs 改为 COSINE_T_MAX（200），保证余弦曲线真的在 200 epoch 走完
+            lrs = apply_cosine_lr_to_optimizer(
+                solver.optimizer,
+                epoch=epoch,
+                warmup_epochs=COSINE_WARMUP_EPOCHS,
+                total_epochs=COSINE_T_MAX,
+                lr_max=INITIAL_LR,
+                lr_min=COSINE_ETA_MIN,
+            )
+            current_lr = solver.get_lr()
+            if epoch % 20 == 0 or epoch in (1, COSINE_WARMUP_EPOCHS):
+                print('[CosineAnneal] epoch=%d lr=%.3e (warmup=%d/%d, T=%d, eta_min=%.3e)' % (
+                    epoch, current_lr, min(epoch, COSINE_WARMUP_EPOCHS), COSINE_WARMUP_EPOCHS,
+                    COSINE_T_MAX, COSINE_ETA_MIN
+                ), file=mylog)
+                print('[CosineAnneal] epoch=%d lr=%.3e (warmup=%d/%d, T=%d, eta_min=%.3e)' % (
+                    epoch, current_lr, min(epoch, COSINE_WARMUP_EPOCHS), COSINE_WARMUP_EPOCHS,
+                    COSINE_T_MAX, COSINE_ETA_MIN
+                ))
+        else:
+            # 旧 Reduce-on-Plateau 路径：保留作 fallback
+            #     注：旧的"硬下界 break"被移除——LR 衰减后即便 old_lr 低于 LR_MIN_BOUND，
+            #     也只打日志、不退出；早停由 no_optim 单独负责。
+            if no_decay > LR_DECAY_THRESHOLD:
+                if solver.old_lr < LR_MIN_BOUND:
+                    print('LR decay skipped: old_lr=%g < LR_MIN_BOUND=%g (will rely on early stop)' % (
+                        solver.old_lr, LR_MIN_BOUND), file=mylog)
+                    print('LR decay skipped: old_lr=%g < LR_MIN_BOUND=%g (will rely on early stop)' % (
+                        solver.old_lr, LR_MIN_BOUND))
+                else:
+                    if LR_DECAY_RELOAD_BEST:
+                        solver.load(os.path.join(SCRIPT_DIR, 'weights', experiment_name + '.th'))
+                    solver.update_lr(LR_DECAY_FACTOR, factor=True, mylog=mylog)
 
     # ===== 双头模式训练 =====
     else:
@@ -888,6 +1036,12 @@ for epoch in range(1, TOTAL_EPOCH + 1):
         writer.add_scalar('Metrics/veg/val_iou', val_v_iou, epoch)
         writer.add_scalar('Metrics/veg/val_f1', val_v_f1, epoch)
 
+        # ---- TensorBoard: 逐 group 学习率曲线（用于审计余弦退火）----
+        writer.add_scalar('LR/encoder', solver.get_lr_by_group('encoder'), epoch)
+        writer.add_scalar('LR/grass',   solver.get_lr_by_group('grass'),   epoch)
+        writer.add_scalar('LR/veg',     solver.get_lr_by_group('veg'),     epoch)
+        writer.add_scalar('LR/shared',  solver.get_lr_by_group('shared'),  epoch)
+
         # ---- mIoU 计算（草线 + 植被均值）----
         val_grass_iou = val_g_iou
         val_veg_iou = val_v_iou
@@ -895,6 +1049,12 @@ for epoch in range(1, TOTAL_EPOCH + 1):
         writer.add_scalar('Metrics/val_miou', val_miou, epoch)
         writer.add_scalar('Metrics/val_grass_iou', val_grass_iou, epoch)
         writer.add_scalar('Metrics/val_veg_iou', val_veg_iou, epoch)
+
+        # ---- DEBUG 监控：loss_ratio（需要在 CSV 写入前计算好） ----
+        if val_loss_veg > 1e-8:
+            loss_ratio = train_loss_grass / max(val_loss_veg, 1e-8)
+        else:
+            loss_ratio = float('inf')
 
         # ---- CSV ----
         csv_writer.writerow([
@@ -911,6 +1071,15 @@ for epoch in range(1, TOTAL_EPOCH + 1):
             val_g_acc, val_g_recall, val_g_iou, val_g_f1,
             val_v_acc, val_v_recall, val_v_iou, val_v_f1,
             val_miou, no_optim,
+            best_grass_iou, best_veg_iou, grass_no_improve_count, veg_no_improve_count,
+            int(grass_frozen), int(veg_frozen), loss_ratio,
+            # ---- 余弦退火逐 epoch LR（方便审计 LR 曲线）----
+            solver.get_lr_by_group('encoder'),
+            solver.get_lr_by_group('grass'),
+            solver.get_lr_by_group('veg'),
+            solver.get_lr_by_group('shared'),
+            'cosine_indep' if (USE_COSINE_ANNEALING and COSINE_USE_INDEPENDENT_TASK_LR)
+            else ('cosine_coupled' if USE_COSINE_ANNEALING else 'plateau'),
         ])
         csv_file.flush()
 
@@ -947,55 +1116,220 @@ for epoch in range(1, TOTAL_EPOCH + 1):
             val_g_acc, val_g_recall, val_g_iou, val_g_f1, val_grass_cdice))
         print('val veg:   acc={:.4f} recall={:.4f} iou={:.4f} f1={:.4f}  cDice={:.6f}'.format(
             val_v_acc, val_v_recall, val_v_iou, val_v_f1, val_veg_cdice))
+
+        # ---- DEBUG：监控 loss_ratio 与 per-head 计数 / 冻结状态 ----
+        # loss_ratio 已在 CSV 写入前计算（位于 938 行附近），此处直接复用
+        ratio_msg = ('[DEBUG loss_ratio(grass_train/veg_val)={:.2f}] '
+                     'grass_iou={:.4f} (best={:.4f}, no_improve={}), '
+                     'veg_iou={:.4f} (best={:.4f}, no_improve={})').format(
+            loss_ratio, val_grass_iou, best_grass_iou, grass_no_improve_count,
+            val_veg_iou, best_veg_iou, veg_no_improve_count)
+        print(ratio_msg, file=mylog)
+        print(ratio_msg)
+        if grass_frozen:
+            frozen_g = '[DEBUG] GRASS FROZEN @ best={:.4f}'.format(best_grass_iou)
+            print(frozen_g, file=mylog)
+            print(frozen_g)
+        if veg_frozen:
+            frozen_v = '[DEBUG] VEG FROZEN @ best={:.4f}'.format(best_veg_iou)
+            print(frozen_v, file=mylog)
+            print(frozen_v)
+
         print('=========')
         mylog.flush()
 
-        # ---- 保存 / 早停 / LR 衰减（基于 mIoU = 草线IoU + 植被IoU 的均值）----
+        # ---- 保存 / 早停 / LR 衰减（双 head 独立信号：grass_iou / veg_iou） ----
 
-        if val_miou <= val_epoch_best_miou:
-            no_optim += 1
-            no_decay += 1
+        # 1) 整体 mIoU best 维护（用于部署的整体最佳权重；与 per-head best 互不影响）
+        if val_miou > val_epoch_best_miou_overall + 1e-4:
+            val_epoch_best_miou_overall = val_miou
+            solver.save(os.path.join(SCRIPT_DIR, 'weights', experiment_name + '_best_overall.th'))
+            writer.add_scalar('Loss/val_best_miou_overall', val_epoch_best_miou_overall, epoch)
+
+        # 2) ramp 结束后才正式计数（解冻 + ramp 期间不计入 no_improve）
+        counting_active = (epoch > WARMUP_EPOCHS + RAMP_EPOCHS)
+
+        # 3) 草线头独立计数 + best
+        if val_grass_iou > best_grass_iou + 1e-4:
+            best_grass_iou = val_grass_iou
+            grass_no_improve_count = 0
+            solver.save(os.path.join(SCRIPT_DIR, 'weights', experiment_name + '_best_grass.th'))
         else:
+            if counting_active and not grass_frozen:
+                grass_no_improve_count += 1
+
+        # 4) 植被头独立计数 + best
+        if val_veg_iou > best_veg_iou + 1e-4:
+            best_veg_iou = val_veg_iou
+            veg_no_improve_count = 0
+            solver.save(os.path.join(SCRIPT_DIR, 'weights', experiment_name + '_best_veg.th'))
+        else:
+            if counting_active and not veg_frozen:
+                veg_no_improve_count += 1
+
+        # 5) 兼容原 no_optim / no_decay（用于整体 mIoU 的衰减触发器 —— 当前改用 per-head 后保留为参考）
+        if val_miou > val_epoch_best_miou + 1e-4:
+            val_epoch_best_miou = val_miou
             no_optim = 0
             no_decay = 0
-            val_epoch_best_miou = val_miou
-            solver.save(os.path.join(SCRIPT_DIR, 'weights', experiment_name + '.th'))
-            writer.add_scalar('Loss/val_best_miou', val_epoch_best_miou, epoch)
-            print('[DualHead] Epoch {}: new best mIoU={:.4f} (grass={:.4f}, veg={:.4f})'.format(
-                epoch, val_miou, val_grass_iou, val_veg_iou), file=mylog)
-            print('[DualHead] Epoch {}: new best mIoU={:.4f} (grass={:.4f}, veg={:.4f})'.format(
-                epoch, val_miou, val_grass_iou, val_veg_iou))
+        else:
+            no_optim += 1
+            no_decay += 1
 
-        # ---- 早停（独立计数器） ----
-        if no_optim > EARLY_STOP_THRESHOLD:
-            msg = '[DualHead] early stop at epoch %d (no mIoU improvement for %d epochs)' % (
-                epoch, EARLY_STOP_THRESHOLD)
+        # ---- LR 调度（余弦退火 / Reduce-on-Plateau 二选一）----
+        if USE_COSINE_ANNEALING:
+            # 余弦退火路径：以 epoch 进度为信号（与 IoU 震荡完全解耦）
+            # 两个任务（草线/植被）默认独立推进各自的余弦曲线：
+            #   grass 任务：影响 encoder(0) + grass(1) + shared(3) 三个 group
+            #   veg  任务：影响 veg(2) 一个 group
+            if COSINE_USE_INDEPENDENT_TASK_LR:
+                # 草线进度
+                lrs_g = apply_cosine_lr_to_optimizer(
+                    solver.optimizer,
+                    epoch=epoch,
+                    warmup_epochs=COSINE_WARMUP_EPOCHS,
+                    total_epochs=COSINE_T_MAX,
+                    lr_max=INITIAL_LR,
+                    lr_min=COSINE_ETA_MIN,
+                    only_indices=[
+                        solver.param_group_indices['encoder'],
+                        solver.param_group_indices['grass'],
+                        solver.param_group_indices['shared'],
+                    ],
+                )
+                # 植被进度（与草线共用同一条进度曲线，但保留 param_group 独立能力，
+                # 后续若想给 veg 单独的 T_max，改这里即可）
+                lrs_v = apply_cosine_lr_to_optimizer(
+                    solver.optimizer,
+                    epoch=epoch,
+                    warmup_epochs=COSINE_WARMUP_EPOCHS,
+                    total_epochs=COSINE_T_MAX,
+                    lr_max=INITIAL_LR,
+                    lr_min=COSINE_ETA_MIN,
+                    only_indices=[solver.param_group_indices['veg']],
+                )
+                current_lr = solver.get_lr()
+                lr_g = solver.get_lr_by_group('grass')
+                lr_v = solver.get_lr_by_group('veg')
+                if epoch % 20 == 0 or epoch in (1, COSINE_WARMUP_EPOCHS):
+                    msg = ('[CosineDual] epoch=%d lr_grass=%.3e lr_veg=%.3e '
+                           '(warmup=%d/%d, T=%d, eta_min=%.3e, independent=True)') % (
+                        epoch, lr_g, lr_v,
+                        min(epoch, COSINE_WARMUP_EPOCHS), COSINE_WARMUP_EPOCHS,
+                        COSINE_T_MAX, COSINE_ETA_MIN
+                    )
+                    print(msg, file=mylog)
+                    print(msg)
+            else:
+                # 草线和植被共用同一条余弦进度（耦合模式）
+                lrs_all = apply_cosine_lr_to_optimizer(
+                    solver.optimizer,
+                    epoch=epoch,
+                    warmup_epochs=COSINE_WARMUP_EPOCHS,
+                    total_epochs=COSINE_T_MAX,
+                    lr_max=INITIAL_LR,
+                    lr_min=COSINE_ETA_MIN,
+                )
+                current_lr = solver.get_lr()
+                if epoch % 20 == 0 or epoch in (1, COSINE_WARMUP_EPOCHS):
+                    msg = ('[CosineDual] epoch=%d lr=%.3e '
+                           '(warmup=%d/%d, T=%d, eta_min=%.3e, independent=False)') % (
+                        epoch, current_lr,
+                        min(epoch, COSINE_WARMUP_EPOCHS), COSINE_WARMUP_EPOCHS,
+                        COSINE_T_MAX, COSINE_ETA_MIN
+                    )
+                    print(msg, file=mylog)
+                    print(msg)
+        else:
+            # 旧 Reduce-on-Plateau 路径：保留作 fallback
+            # grass: 当连续 LR_DECAY_THRESHOLD 个 epoch grass_iou 未创新高时，对 grass + shared 两组同时缩放
+            if grass_no_improve_count > LR_DECAY_THRESHOLD and not grass_frozen:
+                solver.update_lr_group('grass', LR_DECAY_FACTOR, mylog=mylog)
+                solver.update_lr_group('shared', LR_DECAY_FACTOR, mylog=mylog)
+                grass_no_improve_count = 0
+
+            # veg: 当连续 LR_DECAY_THRESHOLD 个 epoch veg_iou 未创新高时，仅缩放 veg 头
+            if veg_no_improve_count > LR_DECAY_THRESHOLD and not veg_frozen:
+                solver.update_lr_group('veg', LR_DECAY_FACTOR, mylog=mylog)
+                veg_no_improve_count = 0
+
+        # ---- 双 head 独立早停 + 冻结 ----
+        # 049 策略 B：余弦退火模式下，仅当 LR 已接近谷底（≤ 5×ETA_MIN）时才允许早停冻结；
+        #              LR 仍高时平台期大概率是伪峰值，重置计数器继续观察。
+        COSINE_FLOOR_FACTOR = 5    # LR 进入谷底 = lr ≤ COSINE_ETA_MIN × factor
+
+        # grass 头早停：冻结草线 decoder；同时把共享模块的 LR 跟降到当前值（不再被 grass 拉动）
+        if grass_no_improve_count > EARLY_STOP_THRESHOLD and not grass_frozen:
+            can_freeze_grass = True
+            lr_grass_now = solver.get_lr_by_group('grass')
+            if USE_COSINE_ANNEALING:
+                grass_floor = COSINE_ETA_MIN * COSINE_FLOOR_FACTOR   # = 1e-6
+                if lr_grass_now > grass_floor:
+                    can_freeze_grass = False
+                    grass_no_improve_count = 0   # 重置计数：LR 还高，伪峰值可能性大
+                    if epoch % 5 == 0:
+                        print('[DualHead] epoch=%d: grass plateau ignored '
+                              '(lr=%.2e > floor=%.2e), reset no_improve counter'
+                              % (epoch, lr_grass_now, grass_floor), file=mylog)
+            if can_freeze_grass:
+                grass_frozen = True
+                solver.set_grass_params_frozen(True)
+                msg = ('[DualHead] Epoch %d: GRASS head early-stopped at best_grass_iou=%.4f '
+                       '(shared LR will continue tracking grass LR — already decayed above)') % (
+                    epoch, best_grass_iou)
+                print(msg, file=mylog)
+                print(msg)
+
+        # veg 头早停：冻结植被 decoder（策略 B 对称应用）
+        if veg_no_improve_count > EARLY_STOP_THRESHOLD and not veg_frozen:
+            can_freeze_veg = True
+            lr_veg_now = solver.get_lr_by_group('veg')
+            if USE_COSINE_ANNEALING:
+                veg_floor = COSINE_ETA_MIN * COSINE_FLOOR_FACTOR
+                if lr_veg_now > veg_floor:
+                    can_freeze_veg = False
+                    veg_no_improve_count = 0
+                    if epoch % 5 == 0:
+                        print('[DualHead] epoch=%d: veg plateau ignored '
+                              '(lr=%.2e > floor=%.2e), reset no_improve counter'
+                              % (epoch, lr_veg_now, veg_floor), file=mylog)
+            if can_freeze_veg:
+                veg_frozen = True
+                solver.set_veg_params_frozen(True)
+                msg = '[DualHead] Epoch %d: VEG head early-stopped at best_veg_iou=%.4f' % (epoch, best_veg_iou)
+                print(msg, file=mylog)
+                print(msg)
+
+        # ---- 整体退出：余弦退火下，任一 head 冻结 + LR 接近谷底即退出 ----
+        # 049 解除"草线冻了植被拖着跑"的耦合：
+        #   - 余弦退火路径：任一冻结 + LR 到底 → 退出（避免 048 epoch 65 伪峰值冻结后陪跑 220 epoch）
+        #   - Reduce 路径：保留原"两 head 都冻结"作为 fallback
+        if USE_COSINE_ANNEALING:
+            grass_lr_now = solver.get_lr_by_group('grass')
+            veg_lr_now   = solver.get_lr_by_group('veg')
+            cos_floor    = COSINE_ETA_MIN * COSINE_FLOOR_FACTOR   # = 1e-6
+            lr_at_floor  = min(grass_lr_now, veg_lr_now) <= cos_floor
+            if (grass_frozen or veg_frozen) and lr_at_floor:
+                msg = ('[DualHead] Epoch %d: EXIT (head-frozen + LR≈floor) '
+                       'grass_frozen=%s veg_frozen=%s '
+                       'best_grass_iou=%.4f best_veg_iou=%.4f '
+                       'lr_grass=%.2e lr_veg=%.2e floor=%.2e') % (
+                    epoch, grass_frozen, veg_frozen,
+                    best_grass_iou, best_veg_iou,
+                    grass_lr_now, veg_lr_now, cos_floor)
+                print(msg, file=mylog)
+                print(msg)
+                break
+        elif grass_frozen and veg_frozen:
+            msg = ('[DualHead] Epoch %d: BOTH heads frozen (Reduce-mode fallback), '
+                   'best_grass_iou=%.4f, best_veg_iou=%.4f, exit.') % (
+                epoch, best_grass_iou, best_veg_iou)
             print(msg, file=mylog)
             print(msg)
             break
 
-        # ---- LR 衰减（独立计数器；不再因 `load 回 best` 反复触发） ----
-        #     注：旧的"LR_MIN_BOUND break"被移除——LR 衰减后即便 old_lr 低于 LR_MIN_BOUND，
-        #     也只打日志、不退出；早停由 no_optim 单独负责。
-        if no_decay > LR_DECAY_THRESHOLD:
-            if solver.old_lr < LR_MIN_BOUND:
-                print('[DualHead] Epoch %d: LR decay skipped (old_lr=%g < LR_MIN_BOUND=%g, '
-                      'will rely on early stop)' % (epoch, solver.old_lr, LR_MIN_BOUND), file=mylog)
-                print('[DualHead] Epoch %d: LR decay skipped (old_lr=%g < LR_MIN_BOUND=%g, '
-                      'will rely on early stop)' % (epoch, solver.old_lr, LR_MIN_BOUND))
-            else:
-                # 植被全量加入后有稳定期保护，不立即衰减学习率
-                veg_grace_epochs = 5
-                epochs_since_veg_full = epoch - WARMUP_EPOCHS - RAMP_EPOCHS
-                if epochs_since_veg_full < veg_grace_epochs:
-                    print('[DualHead] Epoch %d: LR decay skipped (veg grace period, %d/%d), mIoU=%.4f' % (
-                        epoch, epochs_since_veg_full + 1, veg_grace_epochs, val_miou), file=mylog)
-                    print('[DualHead] Epoch %d: LR decay skipped (veg grace period, %d/%d), mIoU=%.4f' % (
-                        epoch, epochs_since_veg_full + 1, veg_grace_epochs, val_miou))
-                else:
-                    if LR_DECAY_RELOAD_BEST:
-                        solver.load(os.path.join(SCRIPT_DIR, 'weights', experiment_name + '.th'))
-                    solver.update_lr(LR_DECAY_FACTOR, factor=True, mylog=mylog)
+        # 注：双头模式下不使用旧的 no_decay 整体 LR 衰减路径；per-head 衰减逻辑在上方。
+        # 单头模式（ENABLE_DUAL_HEAD=False）的 LR 衰减路径在 else 分支中保留。
 
 print('Finish!', file=mylog)
 print('Finish!')

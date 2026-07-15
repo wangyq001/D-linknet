@@ -14,10 +14,24 @@ evaluate_inference.py — 在验证集/测试集上批量推理 D-LinkNet 并保
     修改下方的「用户配置区」，然后:
     python evaluate_inference.py
 
+    也可通过命令行参数覆盖（优先级：命令行 > 环境变量 > 下方常量）：
+        python evaluate_inference.py \
+            --use_dcca True --use_dcfe False \
+            --weight /path/to/w.th --output /path/to/out
+
+    历史训练对应的开关（参考）：
+        049 / 050 : --use_dcca True  --use_dcfe False
+        051       : --use_dcca False --use_dcfe False
+        052       : --use_dcca False --use_dcfe True
+        053       : --use_dcca True  --use_dcfe True
+
 推理完成后，运行评估脚本：
     python evaluate_metrics.py
 """
+import argparse
+import inspect
 import os
+import sys
 import time
 import numpy as np
 import cv2
@@ -36,12 +50,12 @@ MODEL_NAME = 'DinkNet34_less_pool_DualHead_Freq'
 IMAGE_DIR = '/root/autodl-tmp/DLinknet/D-linknet/dataset/val/images'
 
 # 模型权重文件路径（.th 或 .pth 格式）
-WEIGHT_PATH = '/root/autodl-tmp/DLinknet/D-linknet/weights/dink34_045_dual_Freq.th'
+WEIGHT_PATH = '/root/autodl-tmp/DLinknet/D-linknet/weights/dink34_063_FD_best_grass.th'
 
 # 推理输出目录
 #   概率图：{OUTPUT_DIR}/{name}_prob.npy    float32, [0,1]
 #   二值掩码：{OUTPUT_DIR}/{name}_pred.png  uint8, 0/255
-OUTPUT_DIR = '/root/autodl-tmp/DLinknet/D-linknet/predictions/dink34_045_TTA'
+OUTPUT_DIR = '/root/autodl-tmp/DLinknet/D-linknet/predictions/dink34_063_TTA'
 
 # 输入图像的目标尺寸，需与训练时 IMAGE_SHAPE 保持一致
 IMG_SHAPE = (1024, 1024)
@@ -68,9 +82,86 @@ DUAL_HEAD = True
 # 仅在 DUAL_HEAD=True 时使用
 DUAL_HEAD_MODEL_NAME = 'DinkNet34_less_pool_DualHead_Freq'
 
+# --- 消融模块开关（必须与训练时一致，否则 load_state_dict 会失败）
+# 历史训练对应的配置（避免搞错）：
+#   049 / 050 : use_dcca=True,  use_dcfe=False
+#   051       : use_dcca=False, use_dcfe=False
+#   052       : use_dcca=False, use_dcfe=True
+#   053       : use_dcca=True,  use_dcfe=True
+# 这些值仅作为「文件直跑」时的兜底默认值；
+# 命令行 --use_dcca / --use_dcfe 的优先级最高。
+# USE_DCCA = True
+USE_DCCA = False
+
+USE_DCFE = True
+# USE_DCFE = False
+
+
+def _parse_bool(value):
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return None
+    s = str(value).strip().lower()
+    if s in ("1", "true", "t", "yes", "y"):
+        return True
+    if s in ("0", "false", "f", "no", "n", ""):
+        return False
+    raise ValueError(f"无法解析为 bool: {value!r}")
+
+
+def _resolve_cli_defaults():
+    """
+    用 argparse 解析命令行，把结果写回本模块全局变量。
+    优先级：命令行 > 环境变量 > 文件内 USE_DCCA / USE_DCFE。
+    """
+    global WEIGHT_PATH, OUTPUT_DIR, IMAGE_DIR, MASK_THRESHOLD
+    global USE_DCCA, USE_DCFE
+
+    parser = argparse.ArgumentParser(
+        description="D-LinkNet 双头/单头推理脚本（带消融模块开关）",
+        add_help=True,
+    )
+    parser.add_argument("--use_dcca", type=_parse_bool, default=None,
+                        help="是否启用 DCCA 模块（默认读环境变量 EVAL_USE_DCCA，否则取文件内 USE_DCCA）")
+    parser.add_argument("--use_dcfe", type=_parse_bool, default=None,
+                        help="是否启用 DCFE 模块（默认读环境变量 EVAL_USE_DCFE，否则取文件内 USE_DCFE）")
+    parser.add_argument("--weight", default=None,
+                        help=f"权重路径（默认: {WEIGHT_PATH}）")
+    parser.add_argument("--output", default=None,
+                        help=f"输出目录（默认: {OUTPUT_DIR}）")
+    parser.add_argument("--image_dir", default=None,
+                        help=f"图像目录（默认: {IMAGE_DIR}）")
+    parser.add_argument("--threshold", type=float, default=None,
+                        help=f"二值化阈值（默认: {MASK_THRESHOLD}）")
+
+    args, _unknown = parser.parse_known_args()
+
+    if args.use_dcca is not None:
+        USE_DCCA = args.use_dcca
+    elif "EVAL_USE_DCCA" in os.environ:
+        USE_DCCA = _parse_bool(os.environ["EVAL_USE_DCCA"])
+
+    if args.use_dcfe is not None:
+        USE_DCFE = args.use_dcfe
+    elif "EVAL_USE_DCFE" in os.environ:
+        USE_DCFE = _parse_bool(os.environ["EVAL_USE_DCFE"])
+
+    if args.weight is not None:
+        WEIGHT_PATH = args.weight
+    if args.output is not None:
+        OUTPUT_DIR = args.output
+    if args.image_dir is not None:
+        IMAGE_DIR = args.image_dir
+    if args.threshold is not None:
+        MASK_THRESHOLD = args.threshold
+
 
 def build_net():
-    """根据 MODEL_NAME / DUAL_HEAD_MODEL_NAME 构建网络，加载权重，进入 eval 模式。"""
+    """根据 MODEL_NAME / DUAL_HEAD_MODEL_NAME 构建网络，加载权重，进入 eval 模式。
+
+    自动按构造函数签名注入 use_dcca / use_dcfe，避免 load_state_dict 因模块缺失报错。
+    """
     from networks.dinknet import (
         DinkNet34, DinkNet34_less_pool, DinkNet50, DinkNet101, LinkNet34,
         DinkNet34_DualHead, LinkNet34_DualHead, DinkNet50_DualHead,
@@ -101,7 +192,15 @@ def build_net():
     if model_name not in model_map:
         raise ValueError(f"Unknown model: {model_name}. Available: {list(model_map.keys())}")
 
-    net = model_map[model_name]().cuda()
+    # 关键：按构造函数签名注入消融开关，避免 checkpoint 与模型结构不一致
+    sig = inspect.signature(model_map[model_name])
+    kwargs = {}
+    if 'use_dcca' in sig.parameters:
+        kwargs['use_dcca'] = USE_DCCA
+    if 'use_dcfe' in sig.parameters:
+        kwargs['use_dcfe'] = USE_DCFE
+
+    net = model_map[model_name](**kwargs).cuda()
     net = torch.nn.DataParallel(net, device_ids=range(torch.cuda.device_count()))
     state = torch.load(WEIGHT_PATH, map_location='cuda', weights_only=True)
     net.load_state_dict(state)
@@ -224,6 +323,8 @@ def ensure_dir(path):
 
 
 def main():
+    _resolve_cli_defaults()
+
     print("=" * 60)
     mode_str = "双头推理" if DUAL_HEAD else "D-LinkNet 推理"
     print(f"D-LinkNet {mode_str}脚本")
@@ -237,6 +338,7 @@ def main():
         print(f"模型名称 : {DUAL_HEAD_MODEL_NAME} (双头模式)")
     else:
         print(f"模型名称 : {MODEL_NAME}")
+    print(f"消融开关 : use_dcca={USE_DCCA}, use_dcfe={USE_DCFE}")
     print(f"权重文件 : {WEIGHT_PATH}")
     print(f"输出目录 : {OUTPUT_DIR}")
     print(f"图像尺寸 : {IMG_SHAPE}")
@@ -320,6 +422,24 @@ def main():
         print(f"[概率图]   {OUTPUT_DIR}/*_prob.npy")
         print(f"[二值图]   {OUTPUT_DIR}/*_pred.png")
     print(f"\n运行评估脚本: python D-linknet/evaluate_metrics.py")
+
+    # 持久化本次推理的开关与参数，避免以后误用旧预测结果
+    config_log = os.path.join(OUTPUT_DIR, "run_config.txt")
+    ensure_dir(OUTPUT_DIR)
+    with open(config_log, "w") as f:
+        f.write(f"# evaluate_inference.py run config\n")
+        f.write(f"weight_path={WEIGHT_PATH}\n")
+        f.write(f"image_dir={IMAGE_DIR}\n")
+        f.write(f"output_dir={OUTPUT_DIR}\n")
+        f.write(f"img_shape={IMG_SHAPE}\n")
+        f.write(f"tta_enable={TTA_ENABLE}\n")
+        f.write(f"mask_threshold={MASK_THRESHOLD}\n")
+        f.write(f"use_dcca={USE_DCCA}\n")
+        f.write(f"use_dcfe={USE_DCFE}\n")
+        f.write(f"dual_head={DUAL_HEAD}\n")
+        f.write(f"model_name={DUAL_HEAD_MODEL_NAME if DUAL_HEAD else MODEL_NAME}\n")
+        f.write(f"command={' '.join(sys.argv)}\n")
+    print(f"[配置已记录] {config_log}")
 
 
 if __name__ == '__main__':

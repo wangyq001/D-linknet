@@ -1,11 +1,11 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-import cv2
 import numpy as np
-import pywt
+
+
 class dice_bce_loss(nn.Module):
+    """原始 Dice + BCE 联合损失函数。"""
     def __init__(self, batch=True):
         super(dice_bce_loss, self).__init__()
         self.batch = batch
@@ -34,24 +34,15 @@ class dice_bce_loss(nn.Module):
         return bce + dice, bce, dice
 
 
-# ================================================================
-# 损失函数池：7 个独立损失类
-# 参考论文见 docs/方案一详细设计文档.md 附录A
-# ================================================================
-
 class DiceLoss(nn.Module):
-    """
-    标准 Dice Loss
-    论文: Milletari et al., V-Net, arXiv:1606.04797, 2016 [论文3]
-    与 loss.py 原 soft_dice_loss (第12-27行) 逻辑完全一致，smooth=1e-6 更稳定。
-    """
+    """标准 Dice Loss。"""
     def __init__(self, smooth=1e-6):
         super().__init__()
         self.smooth = smooth
 
     def forward(self, pred, target):
         if pred.dim() == 4:
-            pred = pred[:, 0, :, :]  # (B, 1, H, W) → (B, H, W)
+            pred = pred[:, 0, :, :]
         if target.dim() == 4:
             target = target[:, 0, :, :]
         pred = pred.flatten()
@@ -63,44 +54,10 @@ class DiceLoss(nn.Module):
         return 1.0 - score.mean()
 
 
-class BCELoss(nn.Module):
-    """
-    标准 BCE Loss
-    封装 nn.BCELoss()，与 loss.py 第10行和第30行一致。
-    """
-    def __init__(self):
-        super().__init__()
-        self.bce = nn.BCELoss()
-
-    def forward(self, pred, target):
-        return self.bce(pred, target)
-
-
-class FocalLoss(nn.Module):
-    """
-    Focal Loss — Lin et al., ICCV 2017 [论文5]
-    通过 (1-p)^gamma 调制因子降低简单样本权重，聚焦难例。
-    alpha: 正负样本平衡权重（0.25 = 原始 RetinaNet 推荐）
-    gamma: 聚焦参数（2.0 = 原始推荐）
-    """
-    def __init__(self, alpha=0.25, gamma=2.0):
-        super().__init__()
-        self.alpha = alpha
-        self.gamma = gamma
-
-    def forward(self, pred, target):
-        bce = -(target * torch.log(pred + 1e-8) + (1 - target) * torch.log(1 - pred + 1e-8))
-        pt = target * pred + (1 - target) * (1 - pred)
-        focal_weight = (1 - pt) ** self.gamma
-        alpha_weight = target * self.alpha + (1 - target) * (1 - self.alpha)
-        return (alpha_weight * focal_weight * bce).mean()
-
-
 class FocalBCELoss(nn.Module):
     """
-    Focal BCE Loss — 等价于 Focal Loss (alpha=0.5)，二值分割专用。
-    与 FocalLoss 的区别：省略了 alpha 参数，正负样本等权（alpha=0.5）。
-    论文来源同 Focal Loss [论文5]。
+    Focal BCE Loss — 二值分割专用。
+    等价于 Focal Loss（alpha=0.5），通过 (1-p)^gamma 调制因子降低简单样本权重，聚焦难例。
     """
     def __init__(self, gamma=2.0):
         super().__init__()
@@ -113,393 +70,16 @@ class FocalBCELoss(nn.Module):
         return (focal_weight * bce).mean()
 
 
-class TverskyLoss(nn.Module):
-    """
-    Tversky Loss — Salehi et al., MICCAI MLMI 2017 [论文6]
-    Dice 的一般化，通过 alpha/beta 分离 FP 和 FN 的惩罚权重。
-    alpha: FP（误检）惩罚系数，alpha 越大越怕误检
-    beta:  FN（漏检）惩罚系数，beta 越大越怕漏检
-    alpha = beta = 0.5 时退化为标准 Dice Loss。
-    """
-    def __init__(self, alpha=0.5, beta=0.5, smooth=1e-6):
-        super().__init__()
-        self.alpha = alpha
-        self.beta = beta
-        self.smooth = smooth
-
-    def forward(self, pred, target):
-        if pred.dim() == 4:
-            pred = pred[:, 0, :, :]
-        if target.dim() == 4:
-            target = target[:, 0, :, :]
-        pred = pred.flatten()
-        target = target.flatten()
-        tp = torch.sum(pred * target)
-        fp = torch.sum(pred * (1 - target))
-        fn = torch.sum((1 - pred) * target)
-        ti = (tp + self.smooth) / (tp + self.alpha * fp + self.beta * fn + self.smooth)
-        return 1.0 - ti.mean()
-
-
-class FocalTverskyLoss(nn.Module):
-    """
-    Focal Tversky Loss — Abraham & Khan, IEEE ISBI 2019 [论文7]
-    Tversky + Focal 的组合，专门针对小目标/稀疏前景分割。
-    alpha: FP（误检）惩罚系数
-    beta:  FN（漏检）惩罚系数
-    gamma: 聚焦参数，gamma < 1 放大难例与简单例的损失差距
-    本项目推荐: alpha=0.4, beta=0.6, gamma=0.75（偏抑制 FP）
-    """
-    def __init__(self, alpha=0.4, beta=0.6, gamma=0.75, smooth=1e-6):
-        super().__init__()
-        self.alpha = alpha
-        self.beta = beta
-        self.gamma = gamma
-        self.smooth = smooth
-
-    def forward(self, pred, target):
-        if pred.dim() == 4:
-            pred = pred[:, 0, :, :]
-        if target.dim() == 4:
-            target = target[:, 0, :, :]
-        pred = pred.flatten()
-        target = target.flatten()
-        tp = torch.sum(pred * target)
-        fp = torch.sum(pred * (1 - target))
-        fn = torch.sum((1 - pred) * target)
-        ti = (tp + self.smooth) / (tp + self.alpha * fp + self.beta * fn + self.smooth)
-        focal_ti = (1 - ti) ** self.gamma
-        return focal_ti.mean()
-
-
-class ConditionalDiceLoss(nn.Module):
-    """
-    Conditional Dice Loss (cDice / Generalised Dice Loss)
-    Sudre et al., MICCAI DLMIA 2017 [论文4]
-
-    在二值分割场景下与标准 Dice Loss 完全等价。
-    支持三种加权模式：
-
-    mode='boundary': 边界加权
-        - 对靠近目标边界的像素赋予更高权重，改善边缘模糊
-        - 使用高斯距离图：w = exp(-dist^2 / (2*sigma^2))
-        - sigma 越小，边界加权越集中（默认 5）
-
-    mode='connectivity': 连通性加权
-        - 额外计算骨架 Dice，防止道路/管线等连通结构断裂
-        - alpha 控制 Dice 和骨架 Dice 的混合比例（默认 0.5）
-        - 适合道路网络等需要保持拓扑连通的任务
-
-    mode=None: 标准 Dice（无加权，默认）
-
-    推荐用途：
-        - 草线（道路）→ mode='connectivity'（保持道路连通）
-        - 植被（团块）→ mode='boundary'（改善边缘质量）
-    """
-    def __init__(self, smooth=1e-6, mode=None, boundary_sigma=5.0, connectivity_alpha=0.5):
-        super().__init__()
-        self.smooth = smooth
-        self.mode = mode
-        self.boundary_sigma = boundary_sigma
-        self.connectivity_alpha = connectivity_alpha
-
-    def _compute_boundary_weight(self, target_np):
-        """计算边界加权矩阵（CPU/numpy，仅用于生成固定权重图）。返回 (H, W) numpy 数组，值域 (0, 1]。"""
-        target_np = (target_np * 255).astype(np.uint8)
-        dist = cv2.distanceTransform(target_np, cv2.DIST_L2, 5)
-        dist = dist / (self.boundary_sigma * 3)
-        dist = np.clip(dist, 0, 3)
-        weight = np.exp(-dist ** 2 / 2.0)
-        return weight
-
-    def _compute_skeleton(self, binary_np):
-        """计算二值图像的骨架（CPU/numpy，仅用于生成固定权重图）。"""
-        binary_np = binary_np.astype(np.uint8)
-        if binary_np.sum() == 0:
-            return binary_np.astype(np.float32)
-        skeleton = np.zeros_like(binary_np, dtype=np.uint8)
-        element = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
-        temp = binary_np.copy()
-        while True:
-            eroded = cv2.erode(temp, element)
-            opened = cv2.dilate(eroded, element)
-            temp_diff = cv2.subtract(temp, opened)
-            skeleton = cv2.bitwise_or(skeleton, temp_diff)
-            temp = eroded.copy()
-            if temp.sum() == 0:
-                break
-        return skeleton.astype(np.float32)
-
-    def forward(self, pred, target):
-        """所有模式的加权 Dice 计算均保留计算图，支持反向传播。
-
-        权重图（boundary / skeleton）从 target 派生，无需梯度；
-        pred 保持在 GPU tensor 上参与 Dice 计算，梯度正常回传。
-        """
-        # DataParallel 多卡：batch 维保留 GPU 数量
-        # batch=1 时去掉 batch 维；batch>1 时保留整 batch
-        if pred.dim() == 4:
-            if pred.shape[0] == 1:
-                pred = pred.squeeze(0)  # (1, C, H, W) → (C, H, W)
-            # batch>1 时保留不动
-
-        # target 也做对称处理
-        if target.dim() == 4:
-            if target.shape[0] == 1:
-                target = target.squeeze(0)
-
-        # numpy 转换：直接取第 0 张图（batch=1 时 squeeze 后只有一张；batch>1 时取第一张）
-        # DataParallel 下 batch_per_gpu=1，故 target_np[0] 就是当前处理的唯一一张图
-        target_np = target.detach().cpu().numpy()
-        if target_np.ndim == 4:
-            target_np = target_np[0]
-        target_np = target_np.squeeze()
-
-        device = pred.device
-        weight_map = None
-
-        if self.mode == 'boundary':
-            w_np = self._compute_boundary_weight(target_np)
-            weight_map = torch.from_numpy(w_np).to(device)
-
-        elif self.mode == 'connectivity':
-            skel_np = self._compute_skeleton(target_np)
-            boundary_np = 1.0 - self._compute_boundary_weight(target_np)
-            w_np = (1 - self.connectivity_alpha) * boundary_np + self.connectivity_alpha * skel_np
-            weight_map = torch.from_numpy(w_np).to(device)
-
-        pred_flat = pred.flatten()
-        target_flat = target.flatten()
-
-        if weight_map is not None:
-            w = weight_map.flatten()
-            # weight_map 是从 target_np 的第一张图计算的，shape (H*W,)
-            # 当 batch>1 时，需要扩展 weight_map 以匹配完整的 pred_flat / target_flat
-            batch_size = pred_flat.numel() // w.numel()
-            if batch_size > 1:
-                w = w.unsqueeze(0).expand(batch_size, -1).reshape(-1)
-            intersection = torch.sum(pred_flat * target_flat * w)
-            union = torch.sum(pred_flat * w) + torch.sum(target_flat * w)
-        else:
-            intersection = torch.sum(pred_flat * target_flat)
-            union = torch.sum(pred_flat) + torch.sum(target_flat)
-
-        score = (2.0 * intersection + self.smooth) / (union + self.smooth)
-        return 1.0 - score.mean()
-
-
-# ================================================================
-# 草方格网格专用损失：GridLoss
-# 适用于两个方向近似正交（差≈90°）的规则网格结构
-# ================================================================
-
-class GridLoss(nn.Module):
-    """
-    草方格专用复合损失函数。
-
-    L_grid = λ_dir * L_direction + λ_junc * L_junction
-
-    两个正交组件：
-      L_direction  — 正交方向一致性（空间梯度域）
-                     核心：梯度角度折叠到 [0, π/2]，正交方向折叠后重合
-      L_junction   — 交叉点感知（形态学域）
-                     核心：GT 交叉点位置的 BCE 加权惩罚
-
-    适用角度示例：10°/100°、30°/120°、46°/135°、75°/168° 等任意正交角度对。
-    不预设具体方向，从 GT 动态适配。
-
-    forward 返回 dict，支持 return_components=True 查看各分量：
-    {
-        'total':     总损失（用于反向传播），
-        'direction': 方向一致性损失值，
-        'junction':  交叉点感知损失值，
-    }
-    """
-
-    def __init__(
-        self,
-        direction_weight=0.5,
-        junction_weight=0.5,
-        junction_penalty=3.0,
-        threshold=0.5,
-    ):
-        super().__init__()
-        self.direction_weight = direction_weight
-        self.junction_weight = junction_weight
-        self.junction_penalty = junction_penalty
-        self.threshold = threshold
-
-        # Sobel 核（用于计算梯度方向）
-        sobel_x = torch.tensor([
-            [-1, 0, 1],
-            [-2, 0, 2],
-            [-1, 0, 1]
-        ], dtype=torch.float32).unsqueeze(0).unsqueeze(0)
-        self.register_buffer('_sobel_x', sobel_x)
-        self.register_buffer('_sobel_y', sobel_x.transpose(-1, -2))
-
-        # 交叉点检测：十字形结构元素
-        cross = torch.tensor([
-            [0, 1, 0],
-            [1, 1, 1],
-            [0, 1, 0]
-        ], dtype=torch.float32).unsqueeze(0).unsqueeze(0)
-        self.register_buffer('_cross_kernel', cross)
-
-        # 交叉点检测：水平/竖直膨胀核
-        h_ker = torch.ones(1, 1, 1, 5, dtype=torch.float32)
-        v_ker = torch.ones(1, 1, 5, 1, dtype=torch.float32)
-        self.register_buffer('_h_dilate_ker', h_ker)
-        self.register_buffer('_v_dilate_ker', v_ker)
-
-        # 折叠宽度：π/2，两个正交方向折叠后应完全重合
-        self._fold_width = np.pi / 2
-
-    def _gradient_angle(self, binary):
-        """计算二值掩码的梯度角度场 ∈ [0, 2π)"""
-        sobel_x = self._sobel_x.to(binary.device)
-        sobel_y = self._sobel_y.to(binary.device)
-        Gx = F.conv2d(binary, sobel_x, padding=1)
-        Gy = F.conv2d(binary, sobel_y, padding=1)
-        return torch.atan2(Gy, Gx) % (2 * np.pi)
-
-    def _fold_angle(self, angle):
-        """折叠到 [0, fold_width]，使正交方向映射为同一值"""
-        return torch.remainder(angle, self._fold_width)
-
-    def _direction_loss(self, pred_binary, target_binary):
-        """
-        正交方向一致性损失（梯度域）。
-        原理：将 pred 和 target 的梯度角度都折叠到 [0, π/2]，
-        折叠后方向一致性的差异即为损失值。
-        """
-        sobel_x = self._sobel_x.to(pred_binary.device)
-        sobel_y = self._sobel_y.to(pred_binary.device)
-        pred_angle = self._fold_angle(self._gradient_angle(pred_binary))
-        target_angle = self._fold_angle(self._gradient_angle(target_binary))
-
-        diff = torch.abs(pred_angle - target_angle)
-        diff = torch.min(diff, self._fold_width - diff)
-        diff = diff / (self._fold_width / 2)  # 归一化到 [0, 1]
-
-        # 仅在线段区域计算（避免背景噪声干扰）
-        pred_mag = torch.sqrt(
-            F.conv2d(pred_binary, sobel_x, padding=1) ** 2 +
-            F.conv2d(pred_binary, sobel_y, padding=1) ** 2
-        )
-        target_mag = torch.sqrt(
-            F.conv2d(target_binary, sobel_x, padding=1) ** 2 +
-            F.conv2d(target_binary, sobel_y, padding=1) ** 2
-        )
-        line_mask = (pred_mag > 0.1) * (target_mag > 0.1)
-
-        loss = (diff * line_mask.squeeze(1).float()).sum()
-        num = line_mask.sum().clamp(min=1.0)
-        return loss / num
-
-    def _detect_junctions(self, binary):
-        """
-        交叉点检测（形态学法）：
-        交叉点 = 水平膨胀 ⊙ 竖直膨胀 ⊙ 原始掩码 ⊙ 十字确认（邻域 ≥ 4）
-        """
-        h_ker = self._h_dilate_ker.to(binary.device)
-        v_ker = self._v_dilate_ker.to(binary.device)
-        cross = self._cross_kernel.to(binary.device)
-        dilated_h = F.conv2d(binary, h_ker, padding=(0, 2))
-        dilated_v = F.conv2d(binary, v_ker, padding=(2, 0))
-        junctions = dilated_h * dilated_v * binary
-        neighbor_cnt = F.conv2d(binary.float(), cross, padding=1)
-        junctions = junctions * (neighbor_cnt >= 4).float()
-        return junctions
-
-    def _junction_loss(self, pred, target):
-        """
-        交叉点感知损失（形态学域）。
-        原理：GT 交叉点位置的 BCE 应用 junction_penalty 加权，
-        交叉点是网格拓扑的核心节点，预测错误代价更高。
-        """
-        target_binary = target.float()
-        target_junctions = self._detect_junctions(target_binary)
-
-        bce = F.binary_cross_entropy(pred, target, reduction='none')
-        bce = bce.squeeze(1)
-
-        weight_map = torch.ones_like(bce)
-        j_mask = target_junctions.squeeze(1)
-        weight_map = torch.where(
-            j_mask > 0.5,
-            weight_map * self.junction_penalty,
-            weight_map
-        )
-        return (bce * weight_map).mean()
-
-    def forward(self, pred, target, return_components=False):
-        pred_binary = (pred > self.threshold).float()
-        target_binary = target.float()
-
-        dir_val = self._direction_loss(pred_binary, target_binary)
-        junc_val = self._junction_loss(pred, target)
-
-        total = self.direction_weight * dir_val + self.junction_weight * junc_val
-
-        if return_components:
-            return {
-                'total': total,
-                'direction': dir_val.item(),
-                'junction': junc_val.item(),
-            }
-        return total
-
-
-# ================================================================
-# 可配置双任务损失：ConfigurableDualTaskLoss
-# ================================================================
-
 class ConfigurableDualTaskLoss(nn.Module):
     """
-    插件式双任务（草线 / 植被）损失函数。
-
-    每个分支从损失池中选择若干损失组合，权重为 0 表示不使用。
-    所有损失均为独立 nn.Module，支持独立反向传播。
-
-    loss_config 格式（兼容新旧两种写法）:
-        # 旧格式：cDice 只写权重（默认 None 模式，即标准 Dice）
+    可配置双任务损失函数（草线 + 植被）。
+    
+    loss_config 格式:
         {
-            'grass': {
-                'Dice': 1.0,
-                'BCE': 1.0,
-                'cDice': 0.0,          # float → 标准 Dice
-            },
-            'veg': {
-                'Dice': 1.0,
-                'cDice': {'weight': 1.0, 'mode': 'boundary'},  # dict → 带加权模式
-            }
+            'grass': {'Dice': 1.0, 'FocalBCE': 1.0},
+            'veg':   {'Dice': 1.0, 'FocalBCE': 1.0},
         }
-
-        # cDice dict 格式支持以下键（全可选，有默认值）：
-        {
-            'weight':  1.0,           # 损失权重（默认 0.0）
-            'mode':    'boundary',    # 'None'|'boundary'|'connectivity'（默认 None）
-            'sigma':   5.0,          # boundary 模式的高斯 sigma（默认 5.0）
-            'alpha':   0.5,          # connectivity 模式的骨架混合系数（默认 0.5）
-        }
-
-    loss_kwargs（可选）格式:
-        {
-            'FocalTversky': {'alpha': 0.4, 'beta': 0.6, 'gamma': 0.75},
-            'Tversky': {'alpha': 0.5, 'beta': 0.5},
-            'Focal': {'alpha': 0.25, 'gamma': 2.0},
-        }
-
-    GridLoss dict 格式（写在 LOSS_CONFIG 的 grass 分支下）:
-        'GridLoss': {
-            'weight':           0.0,           # 损失总权重，0=不使用（默认）
-            'direction_weight': 0.5,           # 方向一致性权重
-            'junction_weight':  0.5,           # 交叉点感知权重
-            'junction_penalty':  3.0,           # 交叉点 BCE 加权倍率
-        }
-        例如开启: 'GridLoss': {'weight': 0.5, 'direction_weight': 0.5, 'junction_weight': 0.5, 'junction_penalty': 3.0}
-
+    
     forward 返回 dict:
         {
             'total':           总损失（用于反向传播），
@@ -508,138 +88,49 @@ class ConfigurableDualTaskLoss(nn.Module):
             'grass_breakdown': {各损失名称: 数值}，
             'veg_breakdown':   {各损失名称: 数值}，
         }
-
-    推荐配置（默认）:
-        - 草线: Dice=1.0, BCE=1.0（与原训练完全一致）
-        - 植被: Dice=1.0, FocalTversky=0.5（偏抑制 FP）
-
-    连通性/边界加权示例:
-        - 草线（道路）: cDice={'weight': 1.0, 'mode': 'connectivity', 'alpha': 0.5}
-        - 植被（团块）: cDice={'weight': 1.0, 'mode': 'boundary', 'sigma': 5.0}
     """
-    def __init__(self, loss_config=None, loss_kwargs=None):
+    def __init__(self, loss_config=None):
         super().__init__()
         if loss_config is None:
             loss_config = {
-                'grass': {'Dice': 1.0, 'BCE': 1.0, 'Focal': 0.0,
-                          'FocalBCE': 0.0, 'Tversky': 0.0, 'FocalTversky': 0.0,
-                          'cDice': 0.0},
-                'veg':   {'Dice': 1.0, 'BCE': 0.0, 'Focal': 0.0,
-                          'FocalBCE': 0.0, 'Tversky': 0.0, 'FocalTversky': 0.0,
-                          'cDice': 0.0},
+                'grass': {'Dice': 1.0, 'FocalBCE': 1.0},
+                'veg':   {'Dice': 1.0, 'FocalBCE': 1.0},
             }
-        if loss_kwargs is None:
-            loss_kwargs = {}
         self.loss_config = loss_config
 
         self.loss_registry = {
             'Dice': DiceLoss(),
-            'BCE': BCELoss(),
-            'Focal': FocalLoss(**loss_kwargs.get('Focal', {})),
-            'FocalBCE': FocalBCELoss(**loss_kwargs.get('FocalBCE', {})),
-            'Tversky': TverskyLoss(**loss_kwargs.get('Tversky', {})),
-            'FocalTversky': FocalTverskyLoss(**loss_kwargs.get('FocalTversky', {})),
+            'FocalBCE': FocalBCELoss(),
         }
 
-        self._branch_cdice = {}
-        self._branch_gridloss = {}
-        for branch in ('grass', 'veg'):
-            branch_cfg = loss_config.get(branch, {})
-            cdice_cfg = branch_cfg.get('cDice', 0.0)
-            if isinstance(cdice_cfg, dict):
-                mode = cdice_cfg.get('mode')
-                sigma = cdice_cfg.get('sigma', 5.0)
-                alpha = cdice_cfg.get('alpha', 0.5)
-            else:
-                mode = None
-                sigma = 5.0
-                alpha = 0.5
-            self._branch_cdice[branch] = ConditionalDiceLoss(
-                mode=mode, boundary_sigma=sigma, connectivity_alpha=alpha
-            )
-
-            grid_cfg = branch_cfg.get('GridLoss', 0.0)
-            if isinstance(grid_cfg, dict):
-                self._branch_gridloss[branch] = GridLoss(
-                    direction_weight=grid_cfg.get('direction_weight', 0.5),
-                    junction_weight=grid_cfg.get('junction_weight', 0.5),
-                    junction_penalty=grid_cfg.get('junction_penalty', 3.0),
-                )
-            else:
-                self._branch_gridloss[branch] = GridLoss()
-
-        # 从 loss_config 中解析 FAL 配置
-        grass_fal = loss_config.get('grass', {}).get('FAL', {})
-        veg_fal = loss_config.get('veg', {}).get('FAL', {})
-        self.fal_weight_grass = grass_fal.get('weight', 0.0) if isinstance(grass_fal, dict) else float(grass_fal)
-        self.fal_weight_veg = veg_fal.get('weight', 0.0) if isinstance(veg_fal, dict) else float(veg_fal)
-        self.fal_wavelet = grass_fal.get('wavelet', 'db4') if isinstance(grass_fal, dict) else 'db4'
-        self._fal_grass = None
-        self._fal_veg = None
-
     def _parse_weight(self, raw):
-        if isinstance(raw, dict):
-            return raw.get('weight', 0.0), raw
         return float(raw), None
 
-    def _compute_branch_loss(self, pred, target, branch_config, branch_name):
+    def _compute_branch_loss(self, pred, target, branch_config):
         total = 0.0
         breakdown = {}
         for loss_name, raw in branch_config.items():
-            weight, extra = self._parse_weight(raw)
+            weight, _ = self._parse_weight(raw)
             if weight <= 0.0:
                 continue
-            if loss_name == 'cDice':
-                loss_fn = self._branch_cdice[branch_name]
-            elif loss_name == 'GridLoss':
-                loss_fn = self._branch_gridloss[branch_name]
-            elif loss_name == 'FAL':
-                # FAL 由 forward 中统一处理，这里只记录权重信息
-                breakdown[loss_name] = 0.0
-                continue
-            else:
-                loss_fn = self.loss_registry[loss_name]
+            loss_fn = self.loss_registry[loss_name]
             val = loss_fn(pred, target)
             total = total + weight * val
-            if loss_name == 'GridLoss' and isinstance(val, dict):
-                breakdown['direction'] = val.get('direction', 0.0)
-                breakdown['junction'] = val.get('junction', 0.0)
-                breakdown[loss_name] = val.get('total', 0.0)
-            else:
-                breakdown[loss_name] = val.item() if hasattr(val, 'item') else val
+            breakdown[loss_name] = val.item() if hasattr(val, 'item') else val
         return total, breakdown
 
     def forward(self, pred_grass, target_grass, pred_veg, target_veg):
         grass_cfg = self.loss_config.get('grass', {})
         veg_cfg = self.loss_config.get('veg', {})
+
         grass_loss, grass_breakdown = self._compute_branch_loss(
-            pred_grass, target_grass, grass_cfg, 'grass'
+            pred_grass, target_grass, grass_cfg
         )
         veg_loss, veg_breakdown = self._compute_branch_loss(
-            pred_veg, target_veg, veg_cfg, 'veg'
+            pred_veg, target_veg, veg_cfg
         )
 
-        L_freq = 0.0
-        if self.fal_weight_grass > 0:
-            if self._fal_grass is None:
-                self._fal_grass = FrequencyAwareLoss(wavelet=self.fal_wavelet,
-                                                     weight=self.fal_weight_grass)
-            L_fal_g = self._fal_grass(pred_grass, target_grass)
-            L_freq = L_freq + L_fal_g
-            grass_breakdown['FAL'] = L_fal_g.item()
-        else:
-            grass_breakdown['FAL'] = 0.0
-        if self.fal_weight_veg > 0:
-            if self._fal_veg is None:
-                self._fal_veg = FrequencyAwareLoss(wavelet=self.fal_wavelet,
-                                                    weight=self.fal_weight_veg)
-            L_fal_v = self._fal_veg(pred_veg, target_veg)
-            L_freq = L_freq + L_fal_v
-            veg_breakdown['FAL'] = L_fal_v.item()
-        else:
-            veg_breakdown['FAL'] = 0.0
-
-        total_loss = grass_loss + veg_loss + L_freq
+        total_loss = grass_loss + veg_loss
         return {
             'total': total_loss,
             'grass': grass_loss,
@@ -647,61 +138,3 @@ class ConfigurableDualTaskLoss(nn.Module):
             'grass_breakdown': grass_breakdown,
             'veg_breakdown': veg_breakdown,
         }
-
-
-# ================================================================
-# 频域感知损失（参考 FreqU-FNet 论文，arXiv:2505.17544）
-# ================================================================
-
-class FrequencyAwareLoss(nn.Module):
-    """
-    频域感知损失（Frequency-Aware Loss, FAL）。
-
-    参考 FreqU-FNet 论文（arXiv:2505.17544），公式 9-14
-    通过小波变换（DWT）提取预测图和标签的高频子带，
-    计算高频子带之间的 L1 损失，直接监督边缘和纹理细节。
-
-    使用 Daubechies-4 (db4) 小波基：比 Haar 有更好的正则性，
-    对平滑边缘重建质量更高，FreqU-FNet 论文推荐使用 db4。
-    """
-    def __init__(self, wavelet='db4', level=1, weight=0.2):
-        super().__init__()
-        self.wavelet = wavelet
-        self.level = level
-        self.weight = weight
-
-    def forward(self, pred, target):
-        if pred.dim() == 4:
-            pred = pred[:, 0, :, :]
-        if target.dim() == 4:
-            target = target[:, 0, :, :]
-
-        batch_size = pred.size(0)
-        total_loss = 0.0
-
-        for b in range(batch_size):
-            p = pred[b].cpu().detach().numpy()
-            t = target[b].cpu().detach().numpy()
-
-            coeffs_p = pywt.dwt2(p, self.wavelet)
-            coeffs_t = pywt.dwt2(t, self.wavelet)
-
-            _, (p_LH, p_HL, p_HH) = coeffs_p
-            _, (t_LH, t_HL, t_HH) = coeffs_t
-
-            p_LH_t = torch.from_numpy(p_LH).to(pred.device)
-            p_HL_t = torch.from_numpy(p_HL).to(pred.device)
-            p_HH_t = torch.from_numpy(p_HH).to(pred.device)
-            t_LH_t = torch.from_numpy(t_LH).to(target.device)
-            t_HL_t = torch.from_numpy(t_HL).to(target.device)
-            t_HH_t = torch.from_numpy(t_HH).to(target.device)
-
-            l_lh = torch.abs(p_LH_t - t_LH_t).mean()
-            l_hl = torch.abs(p_HL_t - t_HL_t).mean()
-            l_hh = torch.abs(p_HH_t - t_HH_t).mean()
-            loss_freq = (l_lh + l_hl + l_hh) / 3.0
-
-            total_loss += loss_freq
-
-        avg_loss = total_loss / batch_size
-        return self.weight * avg_loss

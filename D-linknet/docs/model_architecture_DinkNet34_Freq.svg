@@ -62,7 +62,7 @@
   <rect x="1280" y="110" width="16" height="12" rx="2" fill="#bfdbfe" stroke="#3b82f6" stroke-width="1"/>
   <text x="1302" y="120" font-size="10" fill="#374151">Spatial Encoder (ResNet34 pretrained)</text>
   <rect x="1280" y="130" width="16" height="12" rx="2" fill="#e9d5ff" stroke="#7c3aed" stroke-width="1"/>
-  <text x="1302" y="140" font-size="10" fill="#374151">Frequency Branch (Haar DWT + EFDCA)</text>
+  <text x="1302" y="140" font-size="10" fill="#374151">Frequency Branch (Haar DWT + 1x1 Linear Proj)</text>
   <rect x="1280" y="150" width="16" height="12" rx="2" fill="#bbf7d0" stroke="#16a34a" stroke-width="1"/>
   <text x="1302" y="160" font-size="10" fill="#374151">Dual Decoders (grass + vegetation)</text>
   <rect x="1280" y="170" width="16" height="12" rx="2" fill="#fef3c7" stroke="#d97706" stroke-width="1"/>
@@ -156,25 +156,25 @@
   <text x="490" y="140" text-anchor="middle" font-size="10" font-weight="700" fill="#6d28d9">12-&gt;64, BN, ReLU</text>
   <text x="490" y="157" text-anchor="middle" font-size="8" fill="#94a3b8">map_f1</text>
 
-  <!-- Arrow to EFDCA f2 -->
+  <!-- Arrow to Linear Proj f2 -->
   <line x1="490" y1="168" x2="490" y2="195" stroke="#7c3aed" stroke-width="2" marker-end="url(#arrPurple)"/>
   <text x="498" y="185" font-size="9" fill="#7c3aed">f1: (64, H/2, W/2)</text>
 
-  <!-- EFDCA block f2 -->
+  <!-- Linear Proj block f2 -->
   <rect x="405" y="200" width="170" height="65" rx="6" fill="white" stroke="#7c3aed" stroke-width="1.8" filter="url(#shadowSm)"/>
-  <text x="490" y="219" text-anchor="middle" font-size="10" font-weight="700" fill="#6d28d9">Conv 64-&gt;128, BN</text>
-  <text x="490" y="233" text-anchor="middle" font-size="10" font-weight="700" fill="#6d28d9">+ EFDCA(128)</text>
-  <text x="490" y="258" text-anchor="middle" font-size="8" fill="#64748b">GAP+GMP | 3xConv1x1 | Sigmoid</text>
+  <text x="490" y="226" text-anchor="middle" font-size="10" font-weight="700" fill="#6d28d9">Linear 1x1 Proj</text>
+  <text x="490" y="241" text-anchor="middle" font-size="10" font-weight="700" fill="#6d28d9">64 -&gt; 128</text>
+  <text x="490" y="258" text-anchor="middle" font-size="8" fill="#64748b">(no BN / ReLU / Sigmoid)</text>
 
-  <!-- Arrow to EFDCA f3 -->
+  <!-- Arrow to Linear Proj f3 -->
   <line x1="490" y1="265" x2="490" y2="292" stroke="#7c3aed" stroke-width="2" marker-end="url(#arrPurple)"/>
   <text x="498" y="282" font-size="9" fill="#7c3aed">f2: (128, H/2, W/2)</text>
 
-  <!-- EFDCA block f3 -->
+  <!-- Linear Proj block f3 -->
   <rect x="405" y="297" width="170" height="65" rx="6" fill="white" stroke="#7c3aed" stroke-width="1.8" filter="url(#shadowSm)"/>
-  <text x="490" y="316" text-anchor="middle" font-size="10" font-weight="700" fill="#6d28d9">Conv 128-&gt;256, BN</text>
-  <text x="490" y="330" text-anchor="middle" font-size="10" font-weight="700" fill="#6d28d9">+ EFDCA(256)</text>
-  <text x="490" y="355" text-anchor="middle" font-size="8" fill="#64748b">Enhanced Frequency-Domain Channel Attention</text>
+  <text x="490" y="323" text-anchor="middle" font-size="10" font-weight="700" fill="#6d28d9">Linear 1x1 Proj</text>
+  <text x="490" y="338" text-anchor="middle" font-size="10" font-weight="700" fill="#6d28d9">128 -&gt; 256</text>
+  <text x="490" y="355" text-anchor="middle" font-size="8" fill="#64748b">(no BN / ReLU / Sigmoid)</text>
 
   <!-- Down arrow f3 out -->
   <line x1="490" y1="362" x2="490" y2="385" stroke="#7c3aed" stroke-width="2" marker-end="url(#arrPurple)"/>
@@ -495,7 +495,7 @@
 
   <rect x="40" y="835" width="510" height="70" rx="6" fill="white" stroke="#cbd5e1" stroke-width="1"/>
   <text x="55" y="853" font-size="10" font-weight="700" fill="#475569">Key Innovations</text>
-  <text x="55" y="869" font-size="9" fill="#64748b">(1) Frequency Branch: Haar DWT + EFDCA extracts high-frequency edge/texture features</text>
+  <text x="55" y="869" font-size="9" fill="#64748b">(1) Frequency Branch: Haar DWT + linear 1x1 projections extract high-frequency edge/texture features</text>
   <text x="55" y="883" font-size="9" fill="#64748b">(2) BCAM Fusion: horizontal self-attention + vertical gating for spatial-freq fusion</text>
   <text x="55" y="897" font-size="9" fill="#64748b">(3) FAL: Daubechies-4 wavelet L1 loss on LH/HL/HH sub-bands (FreqU-FNet)</text>
 

@@ -116,56 +116,6 @@ class HaarWaveletTransform2D(nn.Module):
         return LL, LH, HL, HH
 
 
-class EFDCA(nn.Module):
-    """
-    增强型频域通道注意力（Enhanced Frequency-Domain Channel Attention）。
-
-    参考 DSWFNet 论文 Fig.5，公式 14-18
-    基于 SE 通道注意力改进，增加 GAP+GMP 双路径 + 3 层 1×1 卷积。
-
-    仅做通道注意力加权，不改变通道数。
-    通道变换由调用方通过额外投影层完成。
-    """
-    def __init__(self, channels, reduction=16, drop_path_rate=0.1):
-        super().__init__()
-        self.drop_path_rate = drop_path_rate
-
-        hidden_channels = max(channels // reduction, 8)
-
-        self.fc1 = nn.Conv2d(channels * 2, hidden_channels, kernel_size=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(hidden_channels)
-        self.act1 = nn.ReLU(inplace=True)
-
-        self.fc2 = nn.Conv2d(hidden_channels, hidden_channels, kernel_size=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(hidden_channels)
-        self.act2 = nn.ReLU(inplace=True)
-
-        self.fc3 = nn.Conv2d(hidden_channels, channels, kernel_size=1, bias=False)
-        self.bn3 = nn.BatchNorm2d(channels)
-
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        x_avg = F.adaptive_avg_pool2d(x, output_size=1)
-        x_max = F.adaptive_max_pool2d(x, output_size=1)
-
-        x_cat = torch.cat([x_avg, x_max], dim=1)
-
-        w = self.act1(self.bn1(self.fc1(x_cat)))
-        w = self.act2(self.bn2(self.fc2(w)))
-        w = self.bn3(self.fc3(w))
-        w = self.sigmoid(w)
-
-        if self.training and self.drop_path_rate > 0:
-            batch_size = x.size(0)
-            keep_prob = 1.0 - self.drop_path_rate
-            mask = torch.rand((batch_size, 1, 1, 1),
-                             device=x.device, dtype=x.dtype) < keep_prob
-            w = w * mask.float() / keep_prob
-
-        return x * w
-
-
 class FrequencyBranch(nn.Module):
     """
     频率分支（参考 DSWFNet 论文 Fig.1 右侧 Frequency Branch）。
@@ -174,10 +124,8 @@ class FrequencyBranch(nn.Module):
     将 4 个子带（LL/LH/HL/HH）通过线性 1x1 卷积映射到与 ResNet34 各阶段
     通道数匹配的表示空间。
 
-    设计要点（与前一版的区别）：
+    设计要点：
     - 全部 1x1 投影都不带 BN、不带 ReLU，保留 LL/LH/HL/HH 子带的相对能量。
-    - 不再在内部用 SE/EFDCA，避免 sigmoid 把通道响应压到 1e-3 量级导致
-      后续梯度消失（实测上一版 f3 通道 std 已坍缩到 0.028，fc1 梯度 1e-13）。
     - 输出通过 `f_out_norm` 暴露每层 f_k 的通道 std，便于训练时监控。
     """
     def __init__(self, spatial_channels=(64, 128, 256)):
@@ -346,13 +294,151 @@ class BCAMFusion(nn.Module):
 
     在 decoder3 + e2 和 decoder2 + e1 处使用 BCAM 进行深度融合，
     参考 DSWFNet 论文 Fig.1 中 BCAM 模块的作用位置。
+
+    use_dcca=True  → 调用 DCCA 跨域交叉注意力（方案 B 默认）
+    use_dcca=False → 退化为 decoder_feat + encoder_feat（消融实验对照）
+    """
+    def __init__(self, channels, use_dcca=True):
+        super().__init__()
+        self.use_dcca = use_dcca
+        self.dcca = DCCA(channels)
+
+    def forward(self, decoder_feat, encoder_feat):
+        if self.use_dcca:
+            return self.dcca(decoder_feat, encoder_feat)
+        return decoder_feat + encoder_feat
+
+
+class DCCA(nn.Module):
+    """
+    双向跨域交叉注意力（Dual-direction Cross-domain Cross-Attention）。
+    方案 B 重命名：原 BCAM。
+
+    参考 DSWFNet 论文 Fig.6，公式 19-25 [3]。
+    核心机制与 BCAM 完全一致（行分块水平 attention + element-wise 垂直门控 +
+    per-sample 自适应门控），仅重命名以区分方案 B 的论文叙事。
+    """
+    def __init__(self, channels, num_heads=4):
+        super().__init__()
+        self.num_heads = num_heads
+        self.channels = channels
+
+        self.proj = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
+        self.h_q = nn.Conv2d(channels, channels, kernel_size=1)
+        self.h_kv = nn.Conv2d(channels, channels * 2, kernel_size=1)
+        self.v_q = nn.Conv2d(channels, channels, kernel_size=1)
+        self.v_kv = nn.Conv2d(channels, channels * 2, kernel_size=1)
+        self.gate_fc = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, max(channels // 4, 8), kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(max(channels // 4, 8), 2, kernel_size=1),
+        )
+        self.output_conv = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(channels),
+        )
+        self.mlp = nn.Sequential(
+            nn.Conv2d(channels, channels * 4, kernel_size=1),
+            nn.GELU(),
+            nn.Conv2d(channels * 4, channels, kernel_size=1),
+        )
+
+    def forward(self, spatial_feat, freq_feat):
+        B, C, H, W = spatial_feat.shape
+        F_s = self.proj(spatial_feat)
+        F_f = self.proj(freq_feat)
+        residual = F_s + F_f
+
+        Q_h = self.h_q(F_s)
+        KV_h = self.h_kv(F_f)
+        K_h = KV_h[:, :C, :, :]
+        V_h = KV_h[:, C:, :, :]
+        del KV_h
+
+        chunk_h = 8
+        scale = (C ** 0.5)
+        out_h_parts = []
+
+        for h_start in range(0, H, chunk_h):
+            h_end = min(h_start + chunk_h, H)
+            Q_chunk = Q_h[:, :, h_start:h_end, :]
+            K_chunk = K_h[:, :, h_start:h_end, :]
+            V_chunk = V_h[:, :, h_start:h_end, :]
+            Q_c2 = Q_chunk.reshape(B * (h_end - h_start), C, W)
+            K_c2 = K_chunk.reshape(B * (h_end - h_start), C, W)
+            V_c2 = V_chunk.reshape(B * (h_end - h_start), C, W)
+            attn = torch.softmax(
+                torch.bmm(Q_c2.transpose(1, 2), K_c2) / scale,
+                dim=-1)
+            out_row = torch.bmm(V_c2, attn.transpose(1, 2))
+            out_row = out_row.transpose(1, 2).reshape(B, -1, h_end - h_start, W)
+            out_h_parts.append(out_row)
+            del Q_c2, K_c2, V_c2, attn, out_row
+            torch.cuda.empty_cache()
+
+        out_h = torch.cat(out_h_parts, dim=2)
+        del out_h_parts, Q_h, K_h, V_h
+        torch.cuda.empty_cache()
+        out_h.add_(spatial_feat)
+
+        gate_v = (self.v_q(F_s) + self.v_kv(F_f)[:, :C, :, :]).sigmoid_()
+        out_v = spatial_feat * gate_v + freq_feat * (1 - gate_v)
+
+        gate = self.gate_fc(out_h + out_v)
+        gh = gate[:, 0:1].sigmoid()
+        gv = 1 - gh
+        fused = gh * out_h + gv * out_v
+        del out_h, out_v, gate, gh, gv, gate_v
+
+        out = self.output_conv(fused)
+        del fused
+        out = self.mlp(out)
+        out.add_(residual)
+        return out
+
+
+class DCFE(nn.Module):
+    """
+    方向一致性特征增强器（Direction-Consistency Feature Enhancer）。
+    方案 B 重命名：原 MFE。
+
+    参考 FERDNet 论文公式 1-2 [4]，本实现差异：
+    (1) 4 个独立 strip 卷积核替代旋转共享核；
+    (2) 仅在最深 BCAM 输出后插入 1 次（不级联）；
+    (3) 独立 strip 核针对草方格正交 + 45° 对角交叉节点结构。
     """
     def __init__(self, channels):
         super().__init__()
-        self.bcam = BCAM(channels)
+        self.strip_v  = nn.Conv2d(channels, channels, kernel_size=(1, 3), padding=(0, 1))
+        self.strip_h  = nn.Conv2d(channels, channels, kernel_size=(3, 1), padding=(1, 0))
+        self.strip_ro = nn.Conv2d(channels, channels, kernel_size=(1, 3), padding=(0, 1))
+        self.strip_lo = nn.Conv2d(channels, channels, kernel_size=(1, 3), padding=(0, 1))
 
-    def forward(self, decoder_feat, encoder_feat):
-        return self.bcam(decoder_feat, encoder_feat)
+    def forward(self, x):
+        B, C, H, W = x.shape
+        F_v  = self.strip_v(x)
+        F_h  = self.strip_h(x)
+        F_ro = self.strip_ro(x.transpose(-2, -1)).transpose(-2, -1)
+        F_lo = self.strip_lo(x.transpose(-2, -1).flip(-1)).flip(-2).transpose(-2, -1)
+
+        def cos_sim(a, b):
+            a_flat = a.flatten(2)
+            b_flat = b.flatten(2)
+            norm_a = F.normalize(a_flat, dim=-1)
+            norm_b = F.normalize(b_flat, dim=-1)
+            return (norm_a * norm_b).sum(dim=1).view(B, H, W)
+
+        w_v_h   = cos_sim(F_v, F_h).sigmoid()
+        w_v_ro  = cos_sim(F_v, F_ro).sigmoid()
+        w_v_lo  = cos_sim(F_v, F_lo).sigmoid()
+        w_h_ro  = cos_sim(F_h, F_ro).sigmoid()
+        w_h_lo  = cos_sim(F_h, F_lo).sigmoid()
+        w_ro_lo = cos_sim(F_ro, F_lo).sigmoid()
+
+        W = w_v_h + w_v_ro + w_v_lo + w_h_ro + w_h_lo + w_ro_lo
+
+        return W.unsqueeze(1) * x + x
 
 
 class DinkNet34_less_pool(nn.Module):
@@ -1031,7 +1117,7 @@ class DinkNet34_less_pool_DualHead_Freq(nn.Module):
 
     参考方案文档第九节 9.2 节架构。
     """
-    def __init__(self, num_classes=1):
+    def __init__(self, num_classes=1, use_dcfe=False, use_dcca=True):
         super().__init__()
         shared = DinkNet34_less_pool(num_classes=num_classes)
 
@@ -1046,8 +1132,12 @@ class DinkNet34_less_pool_DualHead_Freq(nn.Module):
 
         self.freq_branch = FrequencyBranch(spatial_channels=(64, 128, 256))
 
-        self.bcam3 = BCAMFusion(channels=128)
-        self.bcam2 = BCAMFusion(channels=64)
+        self.bcam3 = BCAMFusion(channels=128, use_dcca=use_dcca)
+        self.bcam2 = BCAMFusion(channels=64, use_dcca=use_dcca)
+
+        self.use_dcfe = use_dcfe
+        if use_dcfe:
+            self.dcfe3 = DCFE(channels=128)
 
         self.decoder3_grass = copy.deepcopy(shared.decoder3)
         self.decoder2_grass = copy.deepcopy(shared.decoder2)
@@ -1092,6 +1182,8 @@ class DinkNet34_less_pool_DualHead_Freq(nn.Module):
 
         d3_g = self.decoder3_grass(e3)
         d3_fused_g = self.bcam3(d3_g, f2_a) + e2
+        if self.use_dcfe:
+            d3_fused_g = self.dcfe3(d3_fused_g)
         d2_g = self.decoder2_grass(d3_fused_g)
         d2_fused_g = self.bcam2(d2_g, f1_a) + e1
         d1_g = self.decoder1_grass(d2_fused_g)
